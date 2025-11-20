@@ -1,0 +1,99 @@
+{
+    "load_video_1": {
+        "pattern": "msCam[0-9]+\\.avi$",
+        "dtype": "float64",
+        "downsample": null,
+        "downsample_strategy": "subset"
+    },
+    "background_removal": {
+        "method": "tophat",
+        "tophat_wnd": 15,
+        "uniform_wnd": 15
+    },
+    "denoise": {
+        "method": "median", 
+        "fft_low_cut": 0.002,   
+        "fft_high_cut": 0.5,    
+        "fft_order": 5,         
+
+        "gaussian_ksize": [5, 5], 
+        "gaussian_sigmaX": 0,     
+
+        "median_ksize": 5         
+    },
+    "motion_correction": {
+        "npart": 3,
+        "chunk_nfm": null,
+        "max_shift": [15, 15]
+    },
+    "seeds_init": {
+        "method": "rolling",
+        "rolling_wnd_size": 1000,
+        "rolling_stp_size": 500,
+        "rolling_nchunk": 100,
+        "rolling_max_wnd": 15,
+        "rolling_diff_thres": 3,
+        "random_no_param":1
+    },
+    "noise_freq_exploration": {
+        "noise_freq_list": [1.0]
+    },
+    "peak_noise_ratio_refine": {
+        "noise_freq":1.0,
+        "thres": 1.25
+    },
+    "ks_refine": {
+        "sig": 0.05
+    },
+    "merge_seeds": {
+        "thres_dist": 10,
+        "thres_corr": 0.8,
+        "noise_freq":1.0
+    },
+    "visualization_init": {
+        "thres_corr":0.8,
+        "wnd": 10,
+        "noise_freq": 1.0
+    },
+    "first_spatial_update_explore": {
+        "exploration_penalties": [0.01, 0.1, 1.0],
+        "min_size": 10,
+        "max_size": 500,
+        "cnmf_method": "constrained"
+    },
+    "first_spatial_update_exec": {
+        "cnmf_method": "constrained",
+        "n_iter": 5,
+        "thresh_A": 0.1,
+        "min_size": 10,
+        "max_size": 500
+    },
+    "first_temporal_update_explore": {
+        "exploration_penalties": [0.001, 0.01, 0.1],
+        "n_iter": 1
+    },
+    "first_temporal_update_exec": {
+        "n_iter": 5,
+        "lambda_C": 0.01,
+        "thresh_S": 0.05,
+        "p": 2,
+        "ignore_neg": false
+    },
+    "second_spatial_update": {
+        "cnmf_method": "constrained",
+        "n_iter": 5,
+        "thresh_A": 0.1,
+        "min_size": 10,
+        "max_size": 500
+    },
+    "second_temporal_update": {
+        "n_iter": 5,
+        "lambda_C": 0.01,
+        "thresh_S": 0.05,
+        "p": 2,
+        "ignore_neg": false
+    },
+    "save_data": {
+        "dtype": "float32"
+    }
+}

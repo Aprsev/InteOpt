@@ -1,0 +1,15 @@
+minian_ui_project/
+├── minian_core/
+│   ├── __init__.py         # (用户提供的minian核心代码)
+│   ├── cnmf.py             # (用户提供的minian核心代码)
+│   ├── cross_registration.py
+│   ├── initialization.py
+│   ├── motion_correction.py
+│   ├── preprocessing.py    # 需要修改
+│   ├── utilities.py
+│   └── visualization.py    # 需要大改
+├── main.py                 # 主启动文件
+├── startup_window.py       # 开始界面窗口 (PyQt5)
+├── main_pipeline_window.py # 主流程窗口 (PyQt5)
+├── minian_processor.py     # 流程控制和数据处理逻辑
+└── default_config.json     # 默认参数配置文件
