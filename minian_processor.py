@@ -221,39 +221,64 @@ class MinianProcessor:
         self.update_step_status(step_name, "运行中")
         try:            
             params = self.get_step_params(step_name)
-            print(params)
+            
+            # --- 修复开始: 处理 downsample 参数 ---
+            ds_param = params.get('downsample', None)
+            
+            # 如果 downsample 是字符串 (例如 "dict(frame=1...)" 或 "{...}")，尝试转换
+            if isinstance(ds_param, str):
+                try:
+                    # 尝试解析 Python 风格的 dict(...) 字符串
+                    if ds_param.strip().startswith("dict("):
+                        ds_param = eval(ds_param)
+                    # 尝试解析 JSON 风格的字符串
+                    else:
+                        ds_param = json.loads(ds_param)
+                except Exception as e:
+                    self.log_output.append(f"⚠️ 警告: downsample 参数解析失败 ('{ds_param}')，将使用 None。错误: {e}")
+                    ds_param = None
+            # --- 修复结束 ---
+
             # 1. 从参数中提取 load_videos 需要的参数
             load_params = {
                 'pattern': params.get('pattern', r"msCam[0-9]+\.avi$"),
                 'dtype': params.get('dtype', 'uint16'),
-                'downsample': params.get('downsample', None),
+                'downsample': ds_param, # 使用处理后的 ds_param
             }
             
             # 2. 调用 Minian 核心函数: load_videos
-            self.log_output.append("-> 正在加载视频...")
+            self.log_output.append(f"-> 正在加载视频 (downsample={ds_param})...")
             varr = load_videos(vpath=self.video_folder, **load_params)
             
-            varr.to_netcdf(r"D:\Desktop\ZJU\SRTP\demo\minian_visual_cache\origin.nc")
+            # 确保缓存目录存在
+            os.makedirs(self.data_path, exist_ok=True)
+            
+            # 调试保存 (可选)
+            # varr.to_netcdf(os.path.join(self.data_path, "origin.nc"))
 
             # 3. 调用 Minian 核心函数: remove_glow
             self.log_output.append("-> 正在去除光晕...")
             varr_glow_removed = remove_glow(varr=varr)
             
-            varr_glow_removed.to_netcdf(r"D:\Desktop\ZJU\SRTP\demo\minian_visual_cache\varr_glow.nc")
+            # 调试保存 (可选)
+            # varr_glow_removed.to_netcdf(os.path.join(self.data_path, "varr_glow.nc"))
             
             # 4. 保存结果到数据仓库
-            varr_glow_removed = self._save_data_to_repo(varr_glow_removed, 'varr_glow')
+            self._save_data_to_repo(varr_glow_removed, 'varr_glow')
             
             # 5. 更新 FPS
             if 'frame' in varr.coords and 'fs' in varr.coords['frame'].attrs:
-                 self.set_video_fps(varr.coords['frame'].attrs['fs'])
+                self.set_video_fps(varr.coords['frame'].attrs['fs'])
             
             self.log_output.append("✅ 视频加载与光晕去除完成。")
             self.update_step_status(step_name, "已完成")
             return True
             
         except Exception as e:
+            import traceback
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            # 打印详细堆栈，方便调试
+            print(traceback.format_exc()) 
             self.update_step_status(step_name, "错误")
             return False
 
@@ -284,37 +309,31 @@ class MinianProcessor:
                 varr_in = varr_in.astype(np.float32)
             # 1. 获取所有配置参数
             params = self.get_step_params(step_name)
-            # 获取用户在 UI 中选择的模式 (默认为 fft)
-            method = params.get('method', 'fft') 
-            call_kwargs = {} # 最终传递给 denoise 函数的参数字典
-
-            self.log_output.append(f"-> 正在执行降噪：通用模式='{method}'。")
+            method = params.get('method', 'fft')
             
-            # 2. 遍历参数，筛选并清理键名
+            # 打印一下当前拿到的所有参数，用于调试
+            print(f"DEBUG: run_denoise 接收到的完整参数: {params}")
+
+            call_kwargs = {}
             prefix_to_match = f"{method}_"
             
             for key, value in params.items():
                 if key == 'method':
                     continue
-                    
-                # 检查参数键是否以当前 method 为前缀
+                
+                # 逻辑修正：严格匹配前缀
                 if key.startswith(prefix_to_match):
-                    # 提取参数名：去除前缀，例如 'fft_low_cut' -> 'low_cut'
+                    # 剥离前缀： 'fft_low_cut' -> 'low_cut'
                     param_name = key[len(prefix_to_match):]
                     
-                    # 特殊类型处理 (例如 ksize 在 OpenCV 中需要是 tuple)
-                    if 'ksize' in param_name and isinstance(value, list):
+                    # 类型安全转换
+                    if ('ksize' in param_name or 'wnd' in param_name) and isinstance(value, list):
                         value = tuple(value)
-                    
+                        
                     call_kwargs[param_name] = value
             
-            # 3. 针对特定 method 补充额外参数 (如 FFT 需要 fs)
-            if method == 'fft':
-                # FFT 方法需要视频的采样率
-                call_kwargs['fs'] = self.get_video_fps() 
-            
-            self.log_output.append(f"-> 传递给 {method} 的参数: {call_kwargs}")
-
+            # 打印最终传递给函数的参数
+            print(f"DEBUG: 传递给 denoise 函数的参数: {call_kwargs}")
             # 4. 核心调用: denoise
             varr_out = denoise(
                 varr_in,
@@ -359,6 +378,8 @@ class MinianProcessor:
             params = self.get_step_params(step_name)
             method = params.get('method', 'tophat') # 默认为 tophat
             call_kwargs = {} # 用于传递给 remove_background 的参数字典
+            
+            print(f"DEBUG: run_background_removal 接收到的完整参数: {params}")
 
             self.log_output.append(f"-> 正在执行空域背景去除。通用模式='{method}'。")
             
@@ -380,7 +401,7 @@ class MinianProcessor:
                     
                     call_kwargs[param_name] = value
                     
-            self.log_output.append(f"-> 传递给 {method} 的参数: {call_kwargs}")
+            print(f"DEBUG: 传递给 remove_background 函数的参数: {call_kwargs}")
             
             # 核心调用: 使用您提供的 remove_background 函数
             varr_out = remove_background(
@@ -462,7 +483,7 @@ class MinianProcessor:
         步骤 5: 初始化种子 (Seeds Initialization)
         使用 seeds_init 函数计算初始空间组件的候选区域（种子）。
         """
-        step_name = 'seeds_initialization'
+        step_name = 'seeds_init'
         self.update_step_status(step_name, "运行中")
         try:
             # 🚨 移除对 os.environ["MINIAN_INTERMEDIATE"] 的设置和检查，由 UI 负责
@@ -484,34 +505,44 @@ class MinianProcessor:
             # self._save_data_to_repo(varr_in_for_seeds, 'varr_seeds') 
             self._save_data_to_repo(varr_in_for_seeds, 'video_for_seeds_vis')
             
-            # 2. 参数处理：使用默认值作为基础，防止因参数缺失导致的 TypeError
-            DEFAULT_SEEDS_PARAMS = {
-                'wnd_size': 500, 'method': 'rolling', 'stp_size': 200, 
-                'nchunk': 100, 'max_wnd': 10, 'diff_thres': 2,
-            }
-            params_to_pass = DEFAULT_SEEDS_PARAMS.copy() 
-            
             params = self.get_step_params(step_name)
+            print(f"DEBUG: run_seeds_init 接收到的参数: {params}")
+
+            # 2. 确定方法
             method = params.get('method', 'rolling')
-            params_to_pass['method'] = method 
-            self.log_output.append(f"-> 正在执行种子初始化。通用模式='{method}'。")
             
-            # 3. 遍历配置，筛选并清理键名（前缀匹配），并覆盖默认值
+            # 3. 准备参数字典
+            # 不要使用硬编码的 DEFAULT_PARAMS 来初始化，而是根据函数签名动态构建
+            # 或者先定义默认值，然后用 params 覆盖它
+            
+            # 默认值定义 (仅作为兜底，若 config 中有值则会被覆盖)
+            params_to_pass = {
+                'wnd_size': 1000, 
+                'stp_size': 500, 
+                'max_wnd': 15, 
+                'diff_thres': 3,
+                'method': method
+            }
+            
             prefix_to_match = f"{method}_"
+            
             for key, value in params.items():
                 if key == 'method': continue
+                
+                # 如果参数带前缀 (如 rolling_wnd_size)，剥离前缀并覆盖默认值
                 if key.startswith(prefix_to_match):
                     param_name = key[len(prefix_to_match):]
-                    # 仅覆盖 seeds_init 签名中存在的参数
-                    if param_name in DEFAULT_SEEDS_PARAMS:
-                        params_to_pass[param_name] = value 
-            
-            call_kwargs_log = {k: v for k, v in params_to_pass.items() if k != 'method'}
-            self.log_output.append(f"-> 传递给 seeds_init 的参数: {call_kwargs_log}")
-            # print(params)
-            # 4. 调用 Minian 核心函数: seeds_init
+                    params_to_pass[param_name] = value
+                
+                # 如果参数本身就是无前缀的通用参数 (如某些配置可能直接存了 wnd_size)，也允许覆盖
+                elif key in params_to_pass:
+                    params_to_pass[key] = value
+
+            print(f"DEBUG: 最终传递给 seeds_init 的参数: {params_to_pass}")
+
+            # 4. 调用函数
             seeds = seeds_init(varr_in_for_seeds, **params_to_pass)
-            
+                
             # 5. 检查 seeds_init 的返回结果
             if seeds is None or (hasattr(seeds, 'empty') and seeds.empty):
                 self.log_output.append("❌ 核心函数 seeds_init 运行失败或未找到任何种子。请检查参数设置。")
@@ -622,8 +653,12 @@ class MinianProcessor:
                 noise_all = smooth_sig(varr_in, freq, fs, method="butter", btype="high")
                 print(f"noise_all.shape {noise_all.shape}")
                 
-                # 2. 计算 PNR
-                pnr_all = (signal_all.max('frame') - noise_all.mean('frame')) / noise_all.std('frame')
+                 # 计算真正的信号幅度 (Amplitude)
+                signal_baseline = signal_all.min('frame') 
+                signal_amplitude = signal_all.max('frame') - signal_baseline
+                
+                # PNR = 幅度 / 噪声标准差
+                pnr_all = signal_amplitude / noise_all.std('frame')
                 
                 # 3. 计算 PNR 均值
                 print(f"DEBUG: 开始计算频率 {freq} 的 PNR 均值...")
@@ -643,18 +678,12 @@ class MinianProcessor:
             if best_noise_freq is None:
                 raise RuntimeError("未能确定最佳噪声频率。")
 
-            self.log_output.append(f"最佳噪声截止频率确定为: {best_noise_freq} Hz (所有像素点PNR均值: {best_pnr_mean_all:.4f})")
+            # self.log_output.append(f"最佳噪声截止频率确定为: {best_noise_freq} Hz (所有像素点PNR均值: {best_pnr_mean_all:.4f})")
             print(f"最佳噪声截止频率确定为: {best_noise_freq} Hz (所有像素点PNR均值: {best_pnr_mean_all:.4f})")
             self.save_best_freq_to_params(best_noise_freq) 
             print(f"最佳噪声频率已保存")
             
             # ==== Step 3: 基于最佳频率计算种子点数据 (用于返回) ====
-            
-            # 🔴 修正 5: 使用 Xarray 的高级索引正确提取 "坐标对"
-            # (这可以防止 6x6=36 的问题)
-            
-            # a. 将 pandas DataFrame 转换为 xarray DataArray，
-            #    维度为 "sample"
             sample_coords_xr = sample_seeds.to_xarray().rename({'index': 'sample'})
 
             # b. 使用 .sel 和 DataArray 进行点对点索引
@@ -678,16 +707,24 @@ class MinianProcessor:
                  signal_best = xr.DataArray(signal_best, dims=['sample', 'frame'])
                  noise_best = xr.DataArray(noise_best, dims=['sample', 'frame'])
 
-            pnr_best = (signal_best.max('frame') - noise_best.mean('frame')) / noise_best.std('frame')
+            signal_best_baseline = signal_best.mean('frame')
+            pnr_best = (signal_best.max('frame') - signal_best_baseline) / noise_best.std('frame')
             
             # ==== Step 4: 转换结构，并确保返回格式不变 ====
             
-            # (现在 signal_best.values 的形状是 (6, 600), 
-            #  np.expand_dims 后是 (1, 6, 600), 
-            #  这与可视化函数 (1, 36, 600) 的预期不同，但这是正确的数据)
-            signals_arr = np.expand_dims(signal_best.values, axis=0) 
-            noises_arr = np.expand_dims(noise_best.values, axis=0) 
-            pnrs_values = np.expand_dims(pnr_best.values, axis=0) 
+            # 1. 计算信号的基线 (每个样本的均值)
+            # signal_best 形状是 (samples, frames)
+            baselines = signal_best.min(dim='frame') 
+            
+            # 2. 将噪声数据加上这个基线，使其在视觉上与信号重合
+            # 注意：利用广播机制 (samples, frames) + (samples,)
+            noise_best_visual = noise_best + baselines
+            
+            # 3. 导出数据
+            signals_arr = np.expand_dims(signal_best.values, axis=0)
+            # 使用调整过基线的噪声数据用于显示
+            noises_arr = np.expand_dims(noise_best_visual.values, axis=0) 
+            pnrs_values = np.expand_dims(pnr_best.values, axis=0)
             
             pnrs_mean = np.array([np.mean(pnr_best.values)]) 
             

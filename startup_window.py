@@ -208,44 +208,60 @@ class StartupWindow(QWidget):
             
         try:
             intermediate_path = os.path.join(video_folder, "minian_intermediate")
-            
-            # 1. 设置环境变量
             os.environ["MINIAN_INTERMEDIATE"] = intermediate_path
-            
-            # 2. 确保文件夹存在
             os.makedirs(intermediate_path, exist_ok=True)
             print(f"终端交互: MINIAN_INTERMEDIATE 已设置为: {intermediate_path}")
-            
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法创建或设置中间数据路径: {e}")
-            print(f"错误: 无法创建或设置中间数据路径: {e}")
             return
             
         config_path = os.path.join(config_base_dir, "config.json")
         
-        # 3. 处理配置文件初始化逻辑
+        # --- 3. 处理配置文件初始化逻辑 (已修改) ---
         try:
             if self.new_config_radio.isChecked():
-                # 复制 default_config.json 到仓库
-                default_config_src = self.DEFAULT_CONFIG_NAME
-                if not os.path.exists(default_config_src):
-                    # 如果默认配置文件不存在，则创建空的
-                    print(f"警告: {self.DEFAULT_CONFIG_NAME} 未找到，创建空的配置文件。")
-                    default_content = {}
-                    with open(config_path, 'w', encoding='utf-8') as f:
-                        json.dump(default_content, f, indent=4)
-                else:
-                    # 复制默认配置
-                    with open(default_config_src, 'r', encoding='utf-8') as src_f:
-                        default_content = json.load(src_f)
-                    with open(config_path, 'w', encoding='utf-8') as dst_f:
-                        json.dump(default_content, dst_f, indent=4)
+                # === 核心修改开始：检测是否已存在配置 ===
+                should_overwrite = True
                 
-                print(f"终端交互: 已使用默认参数创建新的配置库文件: {config_path}")
-                QMessageBox.information(self, "信息", f"已创建新配置库文件:\n{config_path}\n请在主界面继续运行。")
+                if os.path.exists(config_path):
+                    # 弹窗询问用户
+                    reply = QMessageBox.question(
+                        self, 
+                        "发现现有配置", 
+                        f"检测到该文件夹下已存在配置文件：\n{config_path}\n\n是否直接加载现有参数？\n(点击 'Yes' 保留并加载，点击 'No' 将重置为默认参数)",
+                        QMessageBox.Yes | QMessageBox.No, 
+                        QMessageBox.Yes # 默认选中 Yes，防止手误覆盖
+                    )
+                    
+                    if reply == QMessageBox.Yes:
+                        should_overwrite = False
+                        print(f"终端交互: 用户选择加载现有配置: {config_path}")
+                    else:
+                        print(f"终端交互: 用户选择覆盖/重置配置。")
+
+                # 如果需要覆盖（文件不存在，或者用户选了 No）
+                if should_overwrite:
+                    default_config_src = self.DEFAULT_CONFIG_NAME
+                    if not os.path.exists(default_config_src):
+                        # 如果默认配置文件不存在，则创建空的
+                        print(f"警告: {self.DEFAULT_CONFIG_NAME} 未找到，创建空的配置文件。")
+                        default_content = {}
+                        with open(config_path, 'w', encoding='utf-8') as f:
+                            json.dump(default_content, f, indent=4)
+                    else:
+                        # 复制默认配置
+                        with open(default_config_src, 'r', encoding='utf-8') as src_f:
+                            default_content = json.load(src_f)
+                        with open(config_path, 'w', encoding='utf-8') as dst_f:
+                            json.dump(default_content, dst_f, indent=4)
+                    
+                    print(f"终端交互: 已创建/重置配置库文件: {config_path}")
+                    if not os.path.exists(config_path): # 仅在真的新建时提示，避免每次都弹窗骚扰
+                        QMessageBox.information(self, "信息", f"已初始化新配置库文件:\n{config_path}")
+                # === 核心修改结束 ===
                 
             elif self.import_config_radio.isChecked():
-                # 复制导入的配置到仓库
+                # 导入逻辑一般意味着用户明确想要覆盖，但也可以加个确认，这里暂时保持直接覆盖
                 import_src = self.import_config_path.text()
                 if not os.path.exists(import_src):
                     QMessageBox.critical(self, "错误", "导入的配置文件路径无效。")
@@ -257,8 +273,8 @@ class StartupWindow(QWidget):
                 with open(config_path, 'w', encoding='utf-8') as dst_f:
                     json.dump(imported_content, dst_f, indent=4)
                     
-                print(f"终端交互: 已复制外部配置到配置库文件: {config_path}")
-                QMessageBox.information(self, "信息", f"已导入外部配置并创建配置库文件:\n{config_path}")
+                print(f"终端交互: 已导入外部配置: {config_path}")
+                QMessageBox.information(self, "信息", f"已导入配置:\n{config_path}")
                 
         except json.JSONDecodeError:
             QMessageBox.critical(self, "错误", "配置库文件（或导入文件）的格式不正确（非标准 JSON）。")

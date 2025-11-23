@@ -2,7 +2,7 @@
     "load_video_1": {
         "pattern": "msCam[0-9]+\\.avi$",
         "dtype": "float64",
-        "downsample": null,
+        "downsample": {"frame": 1, "height": 1, "width": 1}, 
         "downsample_strategy": "subset"
     },
     "background_removal": {

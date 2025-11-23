@@ -256,7 +256,7 @@ def load_avi_ffmpeg(fname: str, h: int, w: int, f: int) -> np.ndarray:
     out_bytes, err = (
         ffmpeg.input(fname)
         .video.output("pipe:", format="rawvideo", pix_fmt="gray")
-        .run(capture_stdout=True)
+        .run(capture_stdout=True, capture_stderr=True)
     )
     return np.frombuffer(out_bytes, np.uint8).reshape(f, h, w)
 

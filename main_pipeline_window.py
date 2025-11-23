@@ -581,87 +581,129 @@ class MainPipelineWindow(QWidget):
 
     def _check_and_save_parameters(self, step_name: str) -> bool:
         """
-        读取 UI 中的参数，与库中参数对比，如有更新则保存并返回 True。
+        [修复版] 读取 UI 中的参数，与库中参数对比，如有更新则保存。
         """
         new_params = {}
-        has_changed = False
-        
         current_config = self.processor.get_step_params(step_name)
         
+        print(f"--- 开始读取步骤 {step_name} 的 UI 参数 ---")
+
         # 遍历 QFormLayout 中的所有行
         for i in range(self.param_form_layout.rowCount()):
-        
-            # 1. 获取 Label 对应的 Item
+            
+            # 1. 获取 Label 和 Field
             label_item = self.param_form_layout.itemAt(i, QFormLayout.LabelRole)
-            
-            # 2. 核心修复：检查 item 是否为 None (避免对 None 调用 .widget())
-            if label_item is None:
-                # 如果标签位是空的 (例如，跨列的控件或分隔行)，则跳过
-                continue
-                
-            # 3. 只有 item 存在时，才去尝试获取 widget
-            label_widget = label_item.widget()
-            
-            # 4. 获取 Field 对应的 Item (也需要检查)
             field_item = self.param_form_layout.itemAt(i, QFormLayout.FieldRole)
             
-            # 5. 确保两个 widget 都存在
-            if label_widget is None or field_item is None:
+            if label_item is None or field_item is None:
                 continue
                 
+            label_widget = label_item.widget()
             field_widget = field_item.widget()
-            if field_widget is None:
-                continue
-            param_key = label_widget.text().split('(')[0].strip() # 提取参数名
             
-            # 从 UI 控件中读取值
-            if isinstance(field_widget, QLineEdit):
-                new_val = field_widget.text()
-            elif isinstance(field_widget, (QSpinBox, QDoubleSpinBox)):
-                new_val = field_widget.value()
-            elif isinstance(field_widget, QComboBox):
-                new_val = field_widget.currentText()
-            else:
+            if label_widget is None or field_widget is None:
                 continue
 
-            # 尝试类型转换以匹配配置文件
+            # 2. 获取参数名
+            # 注意：这里要处理可能存在的动态包装器 (Widget Wrapper)
+            # 如果是动态参数，field_widget 可能是一个包含 Label 和 Editor 的 QWidget (HBoxLayout)
+            param_key = label_widget.text().split('(')[0].strip()
+            
+            # 如果是动态行（我们在 update_parameters_panel 里创建的 row_widget）
+            # 这种情况在这个循环里可能直接处理不到内部的 Editor，
+            # 因为 update_parameters_panel 里的动态行是 addRow(row_widget)，没有 LabelRole
+            # 所以这里的逻辑主要处理静态参数和 method 选择器。
+            
+            # --- 处理常规控件 ---
+            val = None
+            if isinstance(field_widget, QLineEdit):
+                val = field_widget.text()
+            elif isinstance(field_widget, (QSpinBox, QDoubleSpinBox)):
+                val = field_widget.value()
+            elif isinstance(field_widget, QComboBox):
+                val = field_widget.currentText()
+            
+            if val is not None:
+                new_params[param_key] = val
+
+        # 3. [关键修复] 专门处理动态控件列表 self._dynamic_widgets
+        # 因为 update_parameters_panel 中，动态参数被放进了 self._dynamic_widgets
+        for key, item in self._dynamic_widgets.items():
+            wrapper = item['widget']
+            # 查找 wrapper 内部的编辑器控件
+            # wrapper layout: [0: Label, 1: Editor]
+            layout = wrapper.layout()
+            if layout and layout.count() > 1:
+                editor = layout.itemAt(1).widget()
+                val = None
+                
+                if isinstance(editor, QLineEdit):
+                    val = editor.text()
+                elif isinstance(editor, (QSpinBox, QDoubleSpinBox)):
+                    val = editor.value()
+                elif isinstance(editor, QComboBox):
+                    val = editor.currentText()
+                
+                if val is not None:
+                    new_params[key] = val
+                    print(f"读取动态参数: {key} = {val}")
+
+        # 4. 类型转换与保存
+        final_params_to_save = {}
+        has_changed = False
+        
+        for key, str_val in new_params.items():
+            # 尝试恢复原始类型
+            old_val = current_config.get(key)
+            
+            # 转换逻辑
             try:
-                # 假设配置文件中的值是标准类型
-                config_val = current_config.get(param_key)
-                if config_val is not None:
-                    expected_type = type(config_val)
-                    if expected_type is int:
-                        new_val = int(new_val)
-                    elif expected_type is float:
-                        new_val = float(new_val)
-                    elif expected_type is bool:
-                        new_val = (new_val.lower() == 'true')
-                    elif expected_type is list:
-                        # 简化处理列表/字典参数
-                        new_val = json.loads(new_val)
+                if old_val is not None:
+                    target_type = type(old_val)
+                    if target_type == bool:
+                        # 处理 "True"/"False" 字符串
+                        final_val = str(str_val).lower() == 'true'
+                    elif target_type == int:
+                        final_val = int(float(str_val)) # 处理 "1.0" 转 int
+                    elif target_type == float:
+                        final_val = float(str_val)
+                    elif target_type in (list, dict):
+                        if isinstance(str_val, str):
+                            final_val = json.loads(str_val)
+                        else:
+                            final_val = str_val
+                    else:
+                        final_val = str_val
+                else:
+                    # 如果配置文件里没有这个值（新增的），尝试智能推断
+                    if isinstance(str_val, str):
+                        if str_val.lower() == 'true': final_val = True
+                        elif str_val.lower() == 'false': final_val = False
+                        elif str_val.replace('.','',1).isdigit(): 
+                            final_val = float(str_val) if '.' in str_val else int(str_val)
+                        else:
+                            final_val = str_val
+                    else:
+                        final_val = str_val
+
+                final_params_to_save[key] = final_val
                 
-                new_params[param_key] = new_val
-                
-                if new_val != config_val:
+                # 检查变更
+                if str(final_val) != str(old_val):
+                    print(f"参数变更: {key} | 旧: {old_val} -> 新: {final_val}")
                     has_changed = True
                     
-            except ValueError:
-                QMessageBox.critical(self, "参数错误", f"参数 '{param_key}' 类型或格式不正确。请检查输入。")
-                return False
-            except json.JSONDecodeError:
-                 QMessageBox.critical(self, "参数错误", f"参数 '{param_key}' 的 JSON 格式不正确。")
-                 return False
+            except Exception as e:
+                print(f"参数转换错误 {key}: {e}")
+                final_params_to_save[key] = str_val # 转换失败保留原值
 
-        if has_changed:
-            self.processor.update_params(step_name, new_params)
-            # 标记所有后续步骤为 '未运行'
-            current_idx = self.step_names.index(step_name)
-            for i in range(current_idx + 1, len(self.step_names)):
-                subsequent_step = self.step_names[i]
-                if self.steps_status[subsequent_step] not in ["未运行", "错误"]:
-                    self.steps_status[subsequent_step] = "未运行"
-            self.update_step_list_widget()
+        # 5. 强制保存
+        # 即使 has_changed 为 False，为了保险起见（防止之前保存失败），建议也调用 update
+        if final_params_to_save:
+            self.processor.update_params(step_name, final_params_to_save)
+            self.log_output.append(f"已更新步骤 {step_name} 的参数。")
             return True
+            
         return False
         
     # =========================================================================
@@ -1066,7 +1108,13 @@ class MainPipelineWindow(QWidget):
                             self.log_output.append("-> 合并可视化: 未找到 'seeds_merged_removed' (移除的种子)。")
 
                         self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}': 合并种子 (白=保留, 红=移除)")         
-                    
+                
+                image_array = create_seeds_visualization(
+                    max_proj, 
+                    seeds_to_keep, 
+                    seeds_removed=seeds_to_remove
+                )
+                
             elif vis_type == "cnmf_init":
                 # 步骤 11: CNMF A, C, b, f 初始化
                 
