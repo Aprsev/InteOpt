@@ -230,17 +230,38 @@ def ensure_env_activated():
 
 
 def choose_conda_exe(preferred: str = None) -> str:
+    import os
+    import shutil
+
+    # 1️⃣ 优先用户指定
     if preferred:
-        exe = shutil.which(preferred)
-        if exe:
+        if os.path.isfile(preferred):
             return preferred
+        found = shutil.which(preferred)
+        if found:
+            return found
         raise RuntimeError(f"找不到指定的 conda 可执行程序: {preferred}")
 
-    for exe in ("mamba", "conda"):
-        if shutil.which(exe):
-            return exe
+    # 2️⃣ PATH查找
+    for name in ("mamba", "conda"):
+        found = shutil.which(name)
+        if found:
+            return found
 
-    raise RuntimeError("未找到 mamba 或 conda，请确认它们已加入 PATH。")
+    # 3️⃣ conda环境推断
+    base = os.environ.get("CONDA_PREFIX") or os.environ.get("CONDA_ROOT")
+    if base:
+        candidates = [
+            os.path.join(base, "Library", "bin", "mamba.exe"),
+            os.path.join(base, "Scripts", "mamba.exe"),
+            os.path.join(base, "condabin", "mamba.bat"),
+            os.path.join(base, "Scripts", "conda.exe"),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+
+    raise RuntimeError("未找到 mamba 或 conda")
 
 
 def install_with_conda(conda_exe: str, channel: str, packages: List[str]) -> List[InstallResult]:
