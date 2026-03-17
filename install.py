@@ -2,7 +2,6 @@ import argparse
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -14,7 +13,6 @@ from typing import List, Tuple
 # 配置区：哪些包优先走 conda/mamba
 # =========================
 CONDA_FIRST_PACKAGES = {
-    # 科学计算 / 编译型 / Windows 常见易炸包
     "numpy",
     "scipy",
     "pandas",
@@ -39,7 +37,6 @@ CONDA_FIRST_PACKAGES = {
     "lxml",
     "pyyaml",
     "tifffile",
-    # jupyter 生态在 Windows 上也更建议 conda
     "jupyter",
     "jupyterlab",
     "ipykernel",
@@ -48,7 +45,6 @@ CONDA_FIRST_PACKAGES = {
     "pywinpty",
 }
 
-# pip 包名到 conda 包名的常见映射
 CONDA_NAME_MAP = {
     "opencv-python": "opencv",
     "pyqt5": "pyqt",
@@ -126,12 +122,7 @@ class Summary:
     pip_failed: List[InstallResult] = field(default_factory=list)
 
 
-# =========================
-# 工具函数
-# =========================
-REQ_LINE_RE = re.compile(
-    r"^\s*([A-Za-z0-9_.\-]+)\s*([<>=!~].*)?$"
-)
+REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*([<>=!~].*)?$")
 
 
 def normalize_name(name: str) -> str:
@@ -159,7 +150,6 @@ def parse_requirements(path: str) -> List[str]:
             if m:
                 pkgs.append(line)
             else:
-                # 保留原样，后面交给 pip 兜底
                 pkgs.append(line)
 
     return pkgs
@@ -183,7 +173,6 @@ def split_requirements(reqs: List[str]) -> Tuple[List[str], List[str]]:
         norm = normalize_name(raw_name)
 
         if norm in CONDA_FIRST_PACKAGES:
-            # conda 名称可能不同
             conda_name = CONDA_NAME_MAP.get(norm, norm)
             version_part = req[len(raw_name):].strip()
             conda_req = f"{conda_name}{version_part}" if version_part else conda_name
@@ -192,32 +181,6 @@ def split_requirements(reqs: List[str]) -> Tuple[List[str], List[str]]:
             pip_list.append(req)
 
     return conda_list, pip_list
-
-
-def run_cmd(cmd: List[str], short_name: str) -> Tuple[bool, str, float]:
-    start = time.time()
-    print_info(f"执行: {' '.join(cmd)}")
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-        )
-        duration = time.time() - start
-        output = proc.stdout.strip()
-
-        if proc.returncode == 0:
-            return True, output, duration
-        return False, output, duration
-
-    except Exception as e:
-        duration = time.time() - start
-        return False, str(e), duration
 
 
 def ensure_env_activated():
@@ -230,10 +193,8 @@ def ensure_env_activated():
 
 
 def choose_conda_exe(preferred: str = None) -> str:
-    import os
     import shutil
 
-    # 1️⃣ 优先用户指定
     if preferred:
         if os.path.isfile(preferred):
             return preferred
@@ -242,13 +203,11 @@ def choose_conda_exe(preferred: str = None) -> str:
             return found
         raise RuntimeError(f"找不到指定的 conda 可执行程序: {preferred}")
 
-    # 2️⃣ PATH查找
     for name in ("mamba", "conda"):
         found = shutil.which(name)
         if found:
             return found
 
-    # 3️⃣ conda环境推断
     base = os.environ.get("CONDA_PREFIX") or os.environ.get("CONDA_ROOT")
     if base:
         candidates = [
@@ -264,56 +223,139 @@ def choose_conda_exe(preferred: str = None) -> str:
     raise RuntimeError("未找到 mamba 或 conda")
 
 
-def install_with_conda(conda_exe: str, channel: str, packages: List[str]) -> List[InstallResult]:
-    results = []
+def run_cmd(cmd: List[str]) -> Tuple[bool, str, float]:
+    start = time.time()
+    print_info(f"执行: {' '.join(cmd)}")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        duration = time.time() - start
+        output = proc.stdout.strip()
+        return proc.returncode == 0, output, duration
+    except Exception as e:
+        duration = time.time() - start
+        return False, str(e), duration
+
+
+def tail_text(output: str, n: int = 20) -> str:
+    if not output:
+        return ""
+    return "\n".join(output.splitlines()[-n:])
+
+
+def install_batch_then_fallback(
+    method: str,
+    batch_cmd: List[str],
+    packages: List[str],
+    single_cmd_builder,
+) -> List[InstallResult]:
+    """
+    先批量安装；如果失败，再逐包回退。
+    method: "conda" or "pip"
+    single_cmd_builder(pkg) -> List[str]
+    """
+    results: List[InstallResult] = []
     if not packages:
         return results
 
-    print_section("Conda/Mamba 安装阶段")
+    print_section(f"{method} 批量安装阶段")
+    print_info(f"批量安装 {len(packages)} 个包")
+
+    ok, output, sec = run_cmd(batch_cmd)
+    if ok:
+        print_ok(f"{method} 批量安装成功 ({sec:.1f}s)")
+        for pkg in packages:
+            results.append(
+                InstallResult(pkg, method, True, message="", duration_sec=sec)
+            )
+        return results
+
+    print_err(f"{method} 批量安装失败 ({sec:.1f}s)，开始逐包回退定位问题")
+    tail = tail_text(output, 30)
+    if tail:
+        print(color(tail, Style.DIM))
 
     total = len(packages)
     for i, pkg in enumerate(packages, 1):
-        print(color(f"[{i}/{total}] conda 安装: {pkg}", Style.BOLD))
-        cmd = [conda_exe, "install", "-y", "-c", channel, pkg]
-        ok, output, sec = run_cmd(cmd, pkg)
+        print(color(f"[{i}/{total}] {method} 单包安装: {pkg}", Style.BOLD))
+        cmd = single_cmd_builder(pkg)
+        ok1, output1, sec1 = run_cmd(cmd)
 
-        if ok:
-            print_ok(f"{pkg} 安装成功 ({sec:.1f}s)")
-            results.append(InstallResult(pkg, "conda", True, duration_sec=sec))
+        if ok1:
+            print_ok(f"{pkg} 安装成功 ({sec1:.1f}s)")
+            results.append(InstallResult(pkg, method, True, duration_sec=sec1))
         else:
-            print_err(f"{pkg} 安装失败 ({sec:.1f}s)")
-            tail = "\n".join(output.splitlines()[-15:]) if output else ""
-            if tail:
-                print(color(tail, Style.DIM))
-            results.append(InstallResult(pkg, "conda", False, message=output, duration_sec=sec))
+            print_err(f"{pkg} 安装失败 ({sec1:.1f}s)")
+            tail1 = tail_text(output1, 20)
+            if tail1:
+                print(color(tail1, Style.DIM))
+            results.append(
+                InstallResult(pkg, method, False, message=output1, duration_sec=sec1)
+            )
 
     return results
+
+
+def install_with_conda(conda_exe: str, channel: str, packages: List[str]) -> List[InstallResult]:
+    if not packages:
+        return []
+
+    batch_cmd = [
+        conda_exe,
+        "install",
+        "-y",
+        "-c",
+        channel,
+        *packages,
+    ]
+
+    # 可选：如果你想进一步减少输出，可加 "--quiet"
+    # batch_cmd.insert(2, "--quiet")
+
+    return install_batch_then_fallback(
+        method="conda",
+        batch_cmd=batch_cmd,
+        packages=packages,
+        single_cmd_builder=lambda pkg: [conda_exe, "install", "-y", "-c", channel, pkg],
+    )
 
 
 def install_with_pip(packages: List[str]) -> List[InstallResult]:
-    results = []
     if not packages:
-        return results
+        return []
 
-    print_section("pip 安装阶段")
+    batch_cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        *packages,
+    ]
 
-    total = len(packages)
-    for i, pkg in enumerate(packages, 1):
-        print(color(f"[{i}/{total}] pip 安装: {pkg}", Style.BOLD))
-        cmd = [sys.executable, "-m", "pip", "install", pkg]
-        ok, output, sec = run_cmd(cmd, pkg)
-
-        if ok:
-            print_ok(f"{pkg} 安装成功 ({sec:.1f}s)")
-            results.append(InstallResult(pkg, "pip", True, duration_sec=sec))
-        else:
-            print_err(f"{pkg} 安装失败 ({sec:.1f}s)")
-            tail = "\n".join(output.splitlines()[-15:]) if output else ""
-            if tail:
-                print(color(tail, Style.DIM))
-            results.append(InstallResult(pkg, "pip", False, message=output, duration_sec=sec))
-
-    return results
+    return install_batch_then_fallback(
+        method="pip",
+        batch_cmd=batch_cmd,
+        packages=packages,
+        single_cmd_builder=lambda pkg: [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-input",
+            pkg,
+        ],
+    )
 
 
 def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, channel: str):
@@ -350,8 +392,7 @@ def print_summary(summary: Summary):
             label = "OK" if item.success else "FAIL"
             print(f"  [{label}] {item.name} ({item.duration_sec:.1f}s)")
             if (not item.success) and item.message:
-                lines = item.message.splitlines()
-                tail = "\n".join(lines[-8:])
+                tail = tail_text(item.message, 8)
                 if tail:
                     print(color(f"      {tail}", Style.DIM))
 
