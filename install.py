@@ -8,6 +8,30 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+# =========================
+# 镜像源配置
+# =========================
+
+DEFAULT_CONDA_CHANNEL = "conda-forge"
+
+CONDA_MIRRORS = {
+    "tsinghua": {
+        "conda-forge": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
+        "pkgs-main": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main",
+        "pkgs-msys2": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2",
+    },
+    "ustc": {
+        "conda-forge": "https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge",
+        "pkgs-main": "https://mirrors.ustc.edu.cn/anaconda/pkgs/main",
+        "pkgs-msys2": "https://mirrors.ustc.edu.cn/anaconda/pkgs/msys2",
+    },
+}
+
+PIP_MIRRORS = {
+    "tsinghua": "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "ustc": "https://mirrors.ustc.edu.cn/pypi/web/simple",
+}
+
 
 # =========================
 # 配置区：哪些包优先走 conda/mamba
@@ -303,32 +327,59 @@ def install_batch_then_fallback(
 
     return results
 
+def get_conda_channel_url(mirror_name: str, channel_name: str) -> str:
+    if mirror_name == "official":
+        return channel_name
 
-def install_with_conda(conda_exe: str, channel: str, packages: List[str]) -> List[InstallResult]:
+    mirror_name = mirror_name.lower()
+    if mirror_name not in CONDA_MIRRORS:
+        raise ValueError(f"不支持的 conda 镜像: {mirror_name}")
+
+    mirror_map = CONDA_MIRRORS[mirror_name]
+    return mirror_map.get(channel_name, channel_name)
+
+
+def get_pip_index_url(mirror_name: str) -> str:
+    if mirror_name == "official":
+        return ""
+
+    mirror_name = mirror_name.lower()
+    if mirror_name not in PIP_MIRRORS:
+        raise ValueError(f"不支持的 pip 镜像: {mirror_name}")
+
+    return PIP_MIRRORS[mirror_name]
+
+def install_with_conda(conda_exe: str, channel: str, packages: List[str], mirror: str = "") -> List[InstallResult]:
     if not packages:
         return []
+
+    channel_url = get_conda_channel_url(mirror, channel)
 
     batch_cmd = [
         conda_exe,
         "install",
         "-y",
         "-c",
-        channel,
+        channel_url,
         *packages,
     ]
-
-    # 可选：如果你想进一步减少输出，可加 "--quiet"
-    # batch_cmd.insert(2, "--quiet")
 
     return install_batch_then_fallback(
         method="conda",
         batch_cmd=batch_cmd,
         packages=packages,
-        single_cmd_builder=lambda pkg: [conda_exe, "install", "-y", "-c", channel, pkg],
+        single_cmd_builder=lambda pkg: [
+            conda_exe,
+            "install",
+            "-y",
+            "-c",
+            channel_url,
+            pkg,
+        ],
     )
 
 
-def install_with_pip(packages: List[str]) -> List[InstallResult]:
+def install_with_pip(packages: List[str], mirror: str = "") -> List[InstallResult]:
     if not packages:
         return []
 
@@ -339,42 +390,40 @@ def install_with_pip(packages: List[str]) -> List[InstallResult]:
         "install",
         "--disable-pip-version-check",
         "--no-input",
-        *packages,
     ]
+
+    pip_index_url = get_pip_index_url(mirror)
+    if pip_index_url:
+        batch_cmd.extend(["-i", pip_index_url])
+
+    batch_cmd.extend(packages)
 
     return install_batch_then_fallback(
         method="pip",
         batch_cmd=batch_cmd,
         packages=packages,
-        single_cmd_builder=lambda pkg: [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-input",
-            pkg,
-        ],
+        single_cmd_builder=lambda pkg: (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "-i",
+                pip_index_url,
+                pkg,
+            ] if pip_index_url else [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                pkg,
+            ]
+        ),
     )
-
-
-def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, channel: str):
-    print_header("安装计划预览")
-    print_info(f"操作系统: {platform.system()} {platform.release()}")
-    print_info(f"Python: {sys.version.split()[0]}")
-    print_info(f"当前环境: {os.environ.get('CONDA_DEFAULT_ENV', '(unknown)')}")
-    print_info(f"环境路径: {os.environ.get('CONDA_PREFIX', '(unknown)')}")
-    print_info(f"Conda执行器: {conda_exe}")
-    print_info(f"Conda频道: {channel}")
-
-    print_section(f"Conda/Mamba 优先安装 ({len(conda_pkgs)} 个)")
-    for pkg in conda_pkgs:
-        print(f"  - {pkg}")
-
-    print_section(f"pip 安装 ({len(pip_pkgs)} 个)")
-    for pkg in pip_pkgs:
-        print(f"  - {pkg}")
-
 
 def print_summary(summary: Summary):
     print_header("安装结果汇总")
@@ -413,8 +462,30 @@ def print_summary(summary: Summary):
     else:
         print_warn("存在失败包。建议优先检查失败列表中的最后几行错误信息。")
 
+def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, channel: str, mirror: str):
+    print_header("安装计划预览")
+    print_info(f"操作系统: {platform.system()} {platform.release()}")
+    print_info(f"Python: {sys.version.split()[0]}")
+    print_info(f"当前环境: {os.environ.get('CONDA_DEFAULT_ENV', '(unknown)')}")
+    print_info(f"环境路径: {os.environ.get('CONDA_PREFIX', '(unknown)')}")
+    print_info(f"Conda执行器: {conda_exe}")
+    print_info(f"Conda频道: {channel}")
+    print_info(f"镜像源: {mirror or '默认官方源'}")
+
+    if mirror:
+        print_info(f"Conda实际地址: {get_conda_channel_url(mirror, channel)}")
+        print_info(f"pip实际地址: {get_pip_index_url(mirror)}")
+
+    print_section(f"Conda/Mamba 优先安装 ({len(conda_pkgs)} 个)")
+    for pkg in conda_pkgs:
+        print(f"  - {pkg}")
+
+    print_section(f"pip 安装 ({len(pip_pkgs)} 个)")
+    for pkg in pip_pkgs:
+        print(f"  - {pkg}")
 
 def main():
+    
     parser = argparse.ArgumentParser(
         description="在已激活 conda 环境中，按 conda/pip 分流安装 requirements。"
     )
@@ -430,6 +501,12 @@ def main():
         help="conda/mamba 使用的 channel，默认 conda-forge",
     )
     parser.add_argument(
+        "--mirror",
+        default="tsinghua",
+        choices=["official", "tsinghua", "ustc"],
+        help="镜像源，默认 tsinghua",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="仅显示分类和安装计划，不实际安装",
@@ -442,7 +519,7 @@ def main():
         reqs = parse_requirements(args.requirements)
         conda_pkgs, pip_pkgs = split_requirements(reqs)
 
-        print_plan(conda_pkgs, pip_pkgs, conda_exe, args.channel)
+        print_plan(conda_pkgs, pip_pkgs, conda_exe, args.channel, args.mirror)
 
         if args.dry_run:
             print_warn("dry-run 模式：未执行安装。")
@@ -450,14 +527,14 @@ def main():
 
         summary = Summary()
 
-        conda_results = install_with_conda(conda_exe, args.channel, conda_pkgs)
+        conda_results = install_with_conda(conda_exe, args.channel, conda_pkgs, args.mirror)
         for r in conda_results:
             if r.success:
                 summary.conda_success.append(r)
             else:
                 summary.conda_failed.append(r)
 
-        pip_results = install_with_pip(pip_pkgs)
+        pip_results = install_with_pip(pip_pkgs, args.mirror)
         for r in pip_results:
             if r.success:
                 summary.pip_success.append(r)
