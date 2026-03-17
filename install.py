@@ -8,10 +8,10 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+
 # =========================
 # 镜像源配置
 # =========================
-
 DEFAULT_CONDA_CHANNEL = "conda-forge"
 
 CONDA_MIRRORS = {
@@ -89,6 +89,7 @@ class Style:
     YELLOW = "\033[33m"
     BLUE = "\033[34m"
     CYAN = "\033[36m"
+    MAGENTA = "\033[35m"
 
 
 def supports_color() -> bool:
@@ -149,6 +150,44 @@ class Summary:
 REQ_LINE_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*([<>=!~].*)?$")
 
 
+# =========================
+# 进度显示
+# =========================
+def make_bar(current: int, total: int, width: int = 24) -> str:
+    if total <= 0:
+        total = 1
+    ratio = current / total
+    filled = int(width * ratio)
+    return "[" + "█" * filled + "-" * (width - filled) + "]"
+
+
+def format_percent(current: int, total: int) -> str:
+    if total <= 0:
+        total = 1
+    return f"{(current / total) * 100:6.2f}%"
+
+
+class ProgressTracker:
+    def __init__(self, total_packages: int):
+        self.total_packages = max(total_packages, 1)
+        self.completed = 0
+
+    def advance(self, package_name: str, method: str, success: bool):
+        self.completed += 1
+        bar = make_bar(self.completed, self.total_packages)
+        pct = format_percent(self.completed, self.total_packages)
+        status = color("SUCCESS", Style.GREEN) if success else color("FAILED", Style.RED)
+        print(color(f"{bar} {self.completed}/{self.total_packages} {pct} [{method}] {package_name} -> {status}", Style.BOLD))
+
+    def show_stage(self, title: str):
+        bar = make_bar(self.completed, self.total_packages)
+        pct = format_percent(self.completed, self.total_packages)
+        print(color(f"{bar} {self.completed}/{self.total_packages} {pct} | {title}", Style.BOLD + Style.MAGENTA))
+
+
+# =========================
+# 基础工具
+# =========================
 def normalize_name(name: str) -> str:
     return name.strip().lower().replace("_", "-")
 
@@ -247,12 +286,53 @@ def choose_conda_exe(preferred: str = None) -> str:
     raise RuntimeError("未找到 mamba 或 conda")
 
 
-def run_cmd(cmd: List[str]) -> Tuple[bool, str, float]:
+def tail_text(output: str, n: int = 20) -> str:
+    if not output:
+        return ""
+    return "\n".join(output.splitlines()[-n:])
+
+
+def filter_realtime_line(line: str) -> str:
+    s = line.rstrip("\n")
+    if not s.strip():
+        return ""
+
+    lower = s.lower()
+
+    if "failed with initial frozen solve" in lower:
+        return color(s, Style.YELLOW)
+    if "solving environment" in lower:
+        return color(s, Style.CYAN)
+    if "collecting package metadata" in lower:
+        return color(s, Style.CYAN)
+    if "downloading and extracting packages" in lower:
+        return color(s, Style.BLUE)
+    if "preparing transaction" in lower:
+        return color(s, Style.BLUE)
+    if "verifying transaction" in lower:
+        return color(s, Style.BLUE)
+    if "executing transaction" in lower:
+        return color(s, Style.BLUE)
+    if "installing collected packages" in lower:
+        return color(s, Style.BLUE)
+    if "successfully installed" in lower:
+        return color(s, Style.GREEN)
+    if "error" in lower or "exception" in lower:
+        return color(s, Style.RED)
+    if "warning" in lower:
+        return color(s, Style.YELLOW)
+
+    return s
+
+
+def run_cmd_live(cmd: List[str], title: str = "") -> Tuple[bool, str, float]:
     start = time.time()
     print_info(f"执行: {' '.join(cmd)}")
+    if title:
+        print(color(f"[LIVE] {title}", Style.BOLD + Style.MAGENTA))
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -260,73 +340,31 @@ def run_cmd(cmd: List[str]) -> Tuple[bool, str, float]:
             encoding="utf-8",
             errors="replace",
             shell=False,
+            bufsize=1,
         )
+
+        output_lines = []
+        assert proc.stdout is not None
+
+        for line in proc.stdout:
+            output_lines.append(line)
+            pretty = filter_realtime_line(line)
+            if pretty:
+                print(pretty, flush=True)
+
+        proc.wait()
         duration = time.time() - start
-        output = proc.stdout.strip()
+        output = "".join(output_lines).strip()
         return proc.returncode == 0, output, duration
+
     except Exception as e:
         duration = time.time() - start
         return False, str(e), duration
 
 
-def tail_text(output: str, n: int = 20) -> str:
-    if not output:
-        return ""
-    return "\n".join(output.splitlines()[-n:])
-
-
-def install_batch_then_fallback(
-    method: str,
-    batch_cmd: List[str],
-    packages: List[str],
-    single_cmd_builder,
-) -> List[InstallResult]:
-    """
-    先批量安装；如果失败，再逐包回退。
-    method: "conda" or "pip"
-    single_cmd_builder(pkg) -> List[str]
-    """
-    results: List[InstallResult] = []
-    if not packages:
-        return results
-
-    print_section(f"{method} 批量安装阶段")
-    print_info(f"批量安装 {len(packages)} 个包")
-
-    ok, output, sec = run_cmd(batch_cmd)
-    if ok:
-        print_ok(f"{method} 批量安装成功 ({sec:.1f}s)")
-        for pkg in packages:
-            results.append(
-                InstallResult(pkg, method, True, message="", duration_sec=sec)
-            )
-        return results
-
-    print_err(f"{method} 批量安装失败 ({sec:.1f}s)，开始逐包回退定位问题")
-    tail = tail_text(output, 30)
-    if tail:
-        print(color(tail, Style.DIM))
-
-    total = len(packages)
-    for i, pkg in enumerate(packages, 1):
-        print(color(f"[{i}/{total}] {method} 单包安装: {pkg}", Style.BOLD))
-        cmd = single_cmd_builder(pkg)
-        ok1, output1, sec1 = run_cmd(cmd)
-
-        if ok1:
-            print_ok(f"{pkg} 安装成功 ({sec1:.1f}s)")
-            results.append(InstallResult(pkg, method, True, duration_sec=sec1))
-        else:
-            print_err(f"{pkg} 安装失败 ({sec1:.1f}s)")
-            tail1 = tail_text(output1, 20)
-            if tail1:
-                print(color(tail1, Style.DIM))
-            results.append(
-                InstallResult(pkg, method, False, message=output1, duration_sec=sec1)
-            )
-
-    return results
-
+# =========================
+# 镜像
+# =========================
 def get_conda_channel_url(mirror_name: str, channel_name: str) -> str:
     if mirror_name == "official":
         return channel_name
@@ -349,7 +387,77 @@ def get_pip_index_url(mirror_name: str) -> str:
 
     return PIP_MIRRORS[mirror_name]
 
-def install_with_conda(conda_exe: str, channel: str, packages: List[str], mirror: str = "") -> List[InstallResult]:
+
+# =========================
+# 安装核心
+# =========================
+def install_batch_then_fallback(
+    method: str,
+    batch_cmd: List[str],
+    packages: List[str],
+    single_cmd_builder,
+    tracker: ProgressTracker,
+) -> List[InstallResult]:
+    """
+    先批量安装；如果失败，再逐包回退。
+    批量阶段：实时日志
+    回退阶段：逐包进度条 + 实时日志
+    """
+    results: List[InstallResult] = []
+    if not packages:
+        return results
+
+    print_section(f"{method} 批量安装阶段")
+    tracker.show_stage(f"{method} 批量安装 {len(packages)} 个包")
+
+    ok, output, sec = run_cmd_live(batch_cmd, title=f"{method} batch install")
+    if ok:
+        print_ok(f"{method} 批量安装成功 ({sec:.1f}s)")
+        for pkg in packages:
+            results.append(
+                InstallResult(pkg, method, True, message="", duration_sec=sec)
+            )
+            tracker.advance(pkg, method, True)
+        return results
+
+    print_err(f"{method} 批量安装失败 ({sec:.1f}s)，开始逐包回退定位问题")
+    tail = tail_text(output, 30)
+    if tail:
+        print(color(tail, Style.DIM))
+
+    total = len(packages)
+    for i, pkg in enumerate(packages, 1):
+        bar = make_bar(i, total)
+        pct = format_percent(i, total)
+        print(color(f"\n{bar} {i}/{total} {pct} {method} 单包安装: {pkg}", Style.BOLD + Style.BLUE))
+
+        cmd = single_cmd_builder(pkg)
+        ok1, output1, sec1 = run_cmd_live(cmd, title=f"{method} single install -> {pkg}")
+
+        if ok1:
+            print_ok(f"{pkg} 安装成功 ({sec1:.1f}s)")
+            results.append(InstallResult(pkg, method, True, duration_sec=sec1))
+            tracker.advance(pkg, method, True)
+        else:
+            print_err(f"{pkg} 安装失败 ({sec1:.1f}s)")
+            tail1 = tail_text(output1, 20)
+            if tail1:
+                print(color(tail1, Style.DIM))
+            results.append(
+                InstallResult(pkg, method, False, message=output1, duration_sec=sec1)
+            )
+            tracker.advance(pkg, method, False)
+
+    return results
+
+
+def install_with_conda(
+    conda_exe: str,
+    channel: str,
+    packages: List[str],
+    mirror: str,
+    tracker: ProgressTracker,
+) -> List[InstallResult]:
     if not packages:
         return []
 
@@ -376,10 +484,15 @@ def install_with_conda(conda_exe: str, channel: str, packages: List[str], mirror
             channel_url,
             pkg,
         ],
+        tracker=tracker,
     )
 
 
-def install_with_pip(packages: List[str], mirror: str = "") -> List[InstallResult]:
+def install_with_pip(
+    packages: List[str],
+    mirror: str,
+    tracker: ProgressTracker,
+) -> List[InstallResult]:
     if not packages:
         return []
 
@@ -423,8 +536,13 @@ def install_with_pip(packages: List[str], mirror: str = "") -> List[InstallResul
                 pkg,
             ]
         ),
+        tracker=tracker,
     )
 
+
+# =========================
+# 展示
+# =========================
 def print_summary(summary: Summary):
     print_header("安装结果汇总")
 
@@ -438,7 +556,7 @@ def print_summary(summary: Summary):
                 print_ok(f"{title}: 0")
 
         for item in items:
-            label = "OK" if item.success else "FAIL"
+            label = color("OK", Style.GREEN) if item.success else color("FAIL", Style.RED)
             print(f"  [{label}] {item.name} ({item.duration_sec:.1f}s)")
             if (not item.success) and item.message:
                 tail = tail_text(item.message, 8)
@@ -462,6 +580,7 @@ def print_summary(summary: Summary):
     else:
         print_warn("存在失败包。建议优先检查失败列表中的最后几行错误信息。")
 
+
 def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, channel: str, mirror: str):
     print_header("安装计划预览")
     print_info(f"操作系统: {platform.system()} {platform.release()}")
@@ -470,11 +589,11 @@ def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, chann
     print_info(f"环境路径: {os.environ.get('CONDA_PREFIX', '(unknown)')}")
     print_info(f"Conda执行器: {conda_exe}")
     print_info(f"Conda频道: {channel}")
-    print_info(f"镜像源: {mirror or '默认官方源'}")
+    print_info(f"镜像源: {mirror}")
 
-    if mirror:
-        print_info(f"Conda实际地址: {get_conda_channel_url(mirror, channel)}")
-        print_info(f"pip实际地址: {get_pip_index_url(mirror)}")
+    print_info(f"Conda实际地址: {get_conda_channel_url(mirror, channel)}")
+    pip_url = get_pip_index_url(mirror)
+    print_info(f"pip实际地址: {pip_url if pip_url else '默认官方源'}")
 
     print_section(f"Conda/Mamba 优先安装 ({len(conda_pkgs)} 个)")
     for pkg in conda_pkgs:
@@ -484,8 +603,11 @@ def print_plan(conda_pkgs: List[str], pip_pkgs: List[str], conda_exe: str, chann
     for pkg in pip_pkgs:
         print(f"  - {pkg}")
 
+
+# =========================
+# 主入口
+# =========================
 def main():
-    
     parser = argparse.ArgumentParser(
         description="在已激活 conda 环境中，按 conda/pip 分流安装 requirements。"
     )
@@ -526,15 +648,20 @@ def main():
             return
 
         summary = Summary()
+        tracker = ProgressTracker(total_packages=len(conda_pkgs) + len(pip_pkgs))
 
-        conda_results = install_with_conda(conda_exe, args.channel, conda_pkgs, args.mirror)
+        conda_results = install_with_conda(
+            conda_exe, args.channel, conda_pkgs, args.mirror, tracker
+        )
         for r in conda_results:
             if r.success:
                 summary.conda_success.append(r)
             else:
                 summary.conda_failed.append(r)
 
-        pip_results = install_with_pip(pip_pkgs, args.mirror)
+        pip_results = install_with_pip(
+            pip_pkgs, args.mirror, tracker
+        )
         for r in pip_results:
             if r.success:
                 summary.pip_success.append(r)
