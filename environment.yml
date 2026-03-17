@@ -37,7 +37,7 @@ dependencies:
   - holoviews=1.12.7
   - panel=0.8.0
   - jupyter
-  - pyqt
+  - PyQt5
   - requests
   - pyyaml
   - natsort

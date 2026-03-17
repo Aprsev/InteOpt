@@ -51,4 +51,4 @@ pyyaml
 tqdm
 ipykernel
 jupyterlab
-pyqt
+PyQt5
