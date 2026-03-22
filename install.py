@@ -83,6 +83,7 @@ PIP_ONLY_PACKAGES = {
     "simpleitk",
     "medpy",
     "pyfftw",
+    "netcdf4",
 }
 
 # Windows 下优先用 mamba 安装的必要包（尽量精简）
