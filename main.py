@@ -25,7 +25,6 @@ def log_uncaught_exceptions(ex_type, ex_value, ex_traceback):
     # 调用默认的异常处理
     sys.__excepthook__(ex_type, ex_value, ex_traceback)
 
-
 if __name__ == "__main__":
     # 设置全局异常捕获
     sys.excepthook = log_uncaught_exceptions

@@ -436,7 +436,12 @@ def update_spatial(
             mask, dims=["unit_id"], coords={"unit_id": A_new.coords["unit_id"].values}
         )
     else:
-        mask = (A_new.sum(["height", "width"]) > 0).compute()
+        # NOTE:
+        # Using raw sum>0 can incorrectly drop valid units when positive/negative
+        # values cancel out numerically. Prefer activity/energy based criterion.
+        pos_area = ((A_new > 0).sum(["height", "width"]) > 0).compute()
+        abs_energy = (np.abs(A_new).sum(["height", "width"]) > 1e-12).compute()
+        mask = xr.where(pos_area, True, abs_energy)
     print("{} out of {} units dropped".format(len(mask) - mask.sum().values, len(mask)))
     A_new = A_new.sel(unit_id=mask)
     if normalize:

@@ -3,7 +3,7 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
-from typing import Dict, Any, Tuple, Optional, Union
+from typing import Dict, Any, Tuple, Optional, Union, List
 import json
 import os
 import dask.array as da
@@ -50,8 +50,9 @@ from minian_core.visualization import (
     create_cnmf_update_plot, 
     create_spatial_update_plot, 
     create_temporal_matrix_plot, 
-    create_merge_matrix_plot
-    
+    create_merge_matrix_plot,
+    create_spatial_exploration_plot,          
+    create_spatial_exploration_compare_plot   
 )
 
 
@@ -71,6 +72,8 @@ class MinianProcessor:
         self.log_output = [] 
         self.step_statuses = {}
         self.steps_results = {}
+        self.exploration_results = {} # save the result of exploration
+        self.exploration_state = {}   # save the state of exploration (e.g., current index in parameter list)
         
         self.data_path = os.path.join(self.dpath, "minian_visual_cache")
         
@@ -95,6 +98,7 @@ class MinianProcessor:
         
     def get_step_params(self, step_name: str) -> Dict[str, Any]:
         # 您的获取参数方法代码...
+        print(f"DEBUG: 获取步骤 '{step_name}' 的参数。{self.config.get(step_name, {})}")
         return self.config.get(step_name, {})
 
     def _load_data_from_repo(self, key: str) -> Any:
@@ -156,16 +160,12 @@ class MinianProcessor:
         self._save_config() 
                 
     def update_step_status(self, step_name: str, status: str):
-        """
-        更新特定步骤的运行状态。
-        （这个方法是您代码运行逻辑所依赖的）
-        """
-        # 假设这里是更新状态字典或 UI 界面的逻辑
-        if hasattr(self, 'status_log'):
-            self.status_log[step_name] = status
-        # 或者其他具体的实现，例如打印到日志
+        self.step_statuses[step_name] = status
         print(f"[STATUS] {step_name}: {status}")
         
+    def get_step_status(self, step_name: str) -> str:
+        return self.step_statuses.get(step_name, "未运行")
+    
     def get_varr_for_vis(self, step_name: str) -> Optional[xr.DataArray]:
         """
         根据步骤名称，从数据仓库中检索用于可视化的 xarray.DataArray (varr)。
@@ -193,8 +193,6 @@ class MinianProcessor:
             'first_spatial_update_exec': None,    # CNMF更新 (cnmf_update)
             'first_temporal_update_explore': None,
             'first_temporal_update_exec': None,
-            'second_spatial_update': None,
-            'second_temporal_update': None,
             'save_data': None,                    # 无可视化 (none)
         }
         
@@ -538,7 +536,7 @@ class MinianProcessor:
                 elif key in params_to_pass:
                     params_to_pass[key] = value
 
-            print(f"DEBUG: 最终传递给 seeds_init 的参数: {params_to_pass}")
+            # print(f"DEBUG: 最终传递给 seeds_init 的参数: {params_to_pass}")
 
             # 4. 调用函数
             seeds = seeds_init(varr_in_for_seeds, **params_to_pass)
@@ -661,9 +659,9 @@ class MinianProcessor:
                 pnr_all = signal_amplitude / noise_all.std('frame')
                 
                 # 3. 计算 PNR 均值
-                print(f"DEBUG: 开始计算频率 {freq} 的 PNR 均值...")
+                # print(f"DEBUG: 开始计算频率 {freq} 的 PNR 均值...")
                 pnr_mean_current_float = pnr_all.mean().compute().item()
-                print(f"DEBUG: 频率 {freq} 的 PNR 均值计算完成: {pnr_mean_current_float:.4f}")
+                # print(f"DEBUG: 频率 {freq} 的 PNR 均值计算完成: {pnr_mean_current_float:.4f}")
                 all_freq_pnr_means[freq] = pnr_mean_current_float
 
                 print(f"For frequency {freq}, the PNR mean is {pnr_mean_current_float:.4f}.Current best is {best_pnr_mean_all:.4f}.")
@@ -894,8 +892,6 @@ class MinianProcessor:
             self.update_step_status(step_name, "错误")
             return False
 
-
-
     def run_ks_refine(self) -> bool:
         """
         步骤 7: KS 检验精修
@@ -975,7 +971,6 @@ class MinianProcessor:
             print(traceback.format_exc())
             self.update_step_status(step_name, "错误")
             return False
-
 
     def run_merge_seeds(self) -> bool:
         """
@@ -1059,7 +1054,6 @@ class MinianProcessor:
             print(traceback.format_exc())
             self.update_step_status(step_name, "错误")
             return False
-
 
     def run_visualization_init(self) -> bool:
         """
@@ -1170,631 +1164,1521 @@ class MinianProcessor:
             self.update_step_status(step_name, "错误")
             return False
 
-    def run_first_spatial_update(self) -> bool:
+    def get_exploration_result(self, step_name: str):
+        return self.exploration_results.get(step_name)
+
+    def get_exploration_penalties(self, step_name: str):
+        data = self.exploration_results.get(step_name, {})
+        return data.get("penalty_list", [])
+
+    def set_exploration_state(self, step_name: str, state: dict):
+        self.exploration_state[step_name] = state
+
+    def get_exploration_state(self, step_name: str):
+        return self.exploration_state.get(step_name, {})
+
+    def _normalize_size_thres(self, val):
+        """Normalize UI/config value for size_thres into either None or a (low, high) tuple.
+
+        Handles string inputs such as 'null'/'None' and JSON lists.
         """
-        步骤 11: 第一次空间更新 (Update Spatial) 与背景更新 (Update Background)
-        并保存 A, C, b, f 的新值。
+        # direct None
+        if val is None:
+            return None
+
+        # strings: try to interpret
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("null", "none", "nan", ""):
+                return None
+            # try JSON-like list/tuple
+            try:
+                parsed = json.loads(val)
+                val = parsed
+            except Exception:
+                # leave as-is (fall through)
+                pass
+
+        # list/tuple -> ensure length 2 and convert inner 'null' to None
+        if isinstance(val, (list, tuple)):
+            out = []
+            for x in list(val)[:2]:
+                if x is None:
+                    out.append(None)
+                elif isinstance(x, str) and str(x).strip().lower() in ("null", "none", "nan", ""):
+                    out.append(None)
+                else:
+                    try:
+                        out.append(float(x))
+                    except Exception:
+                        out.append(None)
+            # pad to length 2
+            if len(out) == 1:
+                out.append(None)
+            return (out[0], out[1])
+
+        # single numeric -> treat as lower bound
+        if isinstance(val, (int, float)):
+            try:
+                return (float(val), None)
+            except Exception:
+                return None
+
+        # fallback
+        return None
+
+    def _diagnose_da(self, da: xr.DataArray, label: str, per_unit: bool = False) -> Dict[str, Any]:
+        """Collect numeric diagnostics for a DataArray and append concise logs.
+
+        This is used to trace why downstream filtering drops all units.
         """
-        step_name = 'first_spatial_update'
+        try:
+            if da is None:
+                diag = {"label": label, "available": False, "reason": "None"}
+                self.log_output.append(f"[DIAG] {label}: None")
+                return diag
+
+            dims = list(getattr(da, "dims", []))
+            sizes = {d: int(da.sizes.get(d, 0)) for d in dims}
+            n_elem = int(np.prod([max(1, sizes[d]) for d in dims])) if dims else int(da.size)
+
+            finite_cnt = int(xr.where(np.isfinite(da), 1, 0).sum().compute().values)
+            pos_cnt = int((da > 0).sum().compute().values)
+            zero_cnt = int(xr.where(da == 0, 1, 0).sum().compute().values)
+            neg_cnt = int((da < 0).sum().compute().values)
+
+            try:
+                g_min = float(da.min().compute().values)
+            except Exception:
+                g_min = float("nan")
+            try:
+                g_max = float(da.max().compute().values)
+            except Exception:
+                g_max = float("nan")
+            try:
+                g_mean = float(da.mean().compute().values)
+            except Exception:
+                g_mean = float("nan")
+            try:
+                abs_sum = float(np.abs(da).sum().compute().values)
+            except Exception:
+                abs_sum = float("nan")
+
+            diag: Dict[str, Any] = {
+                "label": label,
+                "available": True,
+                "dims": dims,
+                "sizes": sizes,
+                "n_elem": n_elem,
+                "finite_cnt": finite_cnt,
+                "non_finite_cnt": int(max(0, n_elem - finite_cnt)),
+                "pos_cnt": pos_cnt,
+                "zero_cnt": zero_cnt,
+                "neg_cnt": neg_cnt,
+                "pos_ratio": float(pos_cnt / n_elem) if n_elem > 0 else 0.0,
+                "zero_ratio": float(zero_cnt / n_elem) if n_elem > 0 else 0.0,
+                "neg_ratio": float(neg_cnt / n_elem) if n_elem > 0 else 0.0,
+                "global_min": g_min,
+                "global_max": g_max,
+                "global_mean": g_mean,
+                "abs_sum": abs_sum,
+            }
+
+            if per_unit and "unit_id" in dims and da.sizes.get("unit_id", 0) > 0:
+                red_dims = [d for d in dims if d != "unit_id"]
+                if len(red_dims) > 0:
+                    pos_per_unit = (da > 0).sum(red_dims).compute().values
+                    abs_per_unit = np.abs(da).sum(red_dims).compute().values
+                    pos_per_unit = np.asarray(pos_per_unit, dtype=np.float64)
+                    abs_per_unit = np.asarray(abs_per_unit, dtype=np.float64)
+
+                    diag["unit_pos_min"] = float(np.nanmin(pos_per_unit)) if pos_per_unit.size else 0.0
+                    diag["unit_pos_median"] = float(np.nanmedian(pos_per_unit)) if pos_per_unit.size else 0.0
+                    diag["unit_pos_max"] = float(np.nanmax(pos_per_unit)) if pos_per_unit.size else 0.0
+                    diag["unit_abs_min"] = float(np.nanmin(abs_per_unit)) if abs_per_unit.size else 0.0
+                    diag["unit_abs_median"] = float(np.nanmedian(abs_per_unit)) if abs_per_unit.size else 0.0
+                    diag["unit_abs_max"] = float(np.nanmax(abs_per_unit)) if abs_per_unit.size else 0.0
+                    diag["units_pos_gt0"] = int((pos_per_unit > 0).sum())
+                    diag["units_abs_gt0"] = int((abs_per_unit > 1e-12).sum())
+
+            self.log_output.append(
+                f"[DIAG] {label}: shape={tuple(da.shape)}, pos/zero/neg=({pos_cnt}/{zero_cnt}/{neg_cnt}), "
+                f"min/mean/max=({g_min:.3e}/{g_mean:.3e}/{g_max:.3e}), abs_sum={abs_sum:.3e}"
+            )
+            if "units_pos_gt0" in diag:
+                self.log_output.append(
+                    f"[DIAG] {label}: units_pos_gt0={diag['units_pos_gt0']}, units_abs_gt0={diag['units_abs_gt0']}, "
+                    f"unit_pos(min/med/max)=({diag['unit_pos_min']:.2f}/{diag['unit_pos_median']:.2f}/{diag['unit_pos_max']:.2f})"
+                )
+            return diag
+        except Exception as e:
+            self.log_output.append(f"[DIAG] {label} 诊断失败: {e}")
+            return {"label": label, "available": False, "reason": str(e)}
+
+    def run_first_spatial_update_explore(self) -> dict:
+        step_name = "first_spatial_update_explore"
         self.update_step_status(step_name, "运行中")
         try:
-            # import matplotlib.pyplot as plt # 不需要直接导入，因为在 create_spatial_update_plot 内部处理
+            varr_mc_raw = self._load_data_from_repo("varr_mc")
+            varr_mc = varr_mc_raw[1] if isinstance(varr_mc_raw, tuple) else varr_mc_raw
+            # print("DEBUG:MC data loaded successfully.")
 
-            # 1. 加载数据
-            intpath = os.environ.get("MINIAN_INTERMEDIATE", "./intermediate_data")
-            varr_mc = self._load_data_from_repo('varr_mc')
-            A_init = self._load_data_from_repo('A_init')
-            C_init = self._load_data_from_repo('C_init')
-            C_chk_init = self._load_data_from_repo('C_init').rename("C_chk") 
-            sn_spatial = self._load_data_from_repo('sn_spatial') 
-            chk = self._load_data_from_repo('chk_settings')
+            A_init = self._load_data_from_repo("A_init")
+            C_init = self._load_data_from_repo("C_init")
+            sn_spatial = self._load_data_from_repo("sn_spatial")
+            b_init = self._load_data_from_repo("b_init")
+            f_init = self._load_data_from_repo("f_init")
             
+            # print("DEBUG:Initialized data loaded successfully.")
+
+            if varr_mc is None or A_init is None or C_init is None:
+                raise ValueError("缺少 first_spatial_update_explore 所需输入数据(varr_mc/A_init/C_init)")
+
+            # 1) 输入一致性修复：A/C 对齐 unit_id
+            if "unit_id" in A_init.coords and "unit_id" in C_init.coords:
+                common_units = np.intersect1d(
+                    A_init.coords["unit_id"].values,
+                    C_init.coords["unit_id"].values,
+                )
+                if len(common_units) == 0:
+                    raise ValueError("A_init 与 C_init 没有公共 unit_id")
+                if len(common_units) != len(A_init.coords["unit_id"]) or len(common_units) != len(C_init.coords["unit_id"]):
+                    self.log_output.append(
+                        f"⚠️ A_init/C_init unit_id 不一致，已自动对齐到 {len(common_units)} 个公共单元。"
+                    )
+                A_init = A_init.sel(unit_id=common_units)
+                C_init = C_init.sel(unit_id=common_units)
+                self._save_data_to_repo(A_init, "A_init")
+                self._save_data_to_repo(C_init, "C_init")
+
+            # 2) 自动补齐/修复 sn_spatial
+            need_recompute_sn = sn_spatial is None
+            if (not need_recompute_sn) and hasattr(sn_spatial, "shape") and hasattr(varr_mc, "shape"):
+                try:
+                    need_recompute_sn = tuple(sn_spatial.shape) != tuple(varr_mc.shape[1:])
+                except Exception:
+                    need_recompute_sn = True
+
+            if need_recompute_sn:
+                self.log_output.append("⚠️ sn_spatial 缺失或形状不匹配，正在自动重算...")
+                sn_spatial = get_noise_fft(varr_mc.chunk({"frame": -1})).rename("sn_spatial")
+                self._save_data_to_repo(sn_spatial, "sn_spatial")
+
+            # 3) 关键修复：update_spatial 的核心维度需要单块
+            # 报错: Core dimension 'f' consists of multiple chunks
+            # 对应到本流程即时间维(frame)必须 rechunk 为单块
+            if hasattr(varr_mc, "chunk") and "frame" in getattr(varr_mc, "dims", []):
+                varr_mc = varr_mc.chunk({"frame": -1})
+            if hasattr(C_init, "chunk") and "frame" in getattr(C_init, "dims", []):
+                C_init = C_init.chunk({"frame": -1})
+
+            # 4) 数值稳定性修复：清理 NaN/Inf/过大值，避免 update_spatial 内部报
+            # "Input contains NaN, infinity or a value too large for dtype('float32')"
+            def _sanitize_da(da: xr.DataArray, clip_abs: float = 1e6) -> xr.DataArray:
+                da = xr.where(np.isfinite(da), da, np.float32(0.0))
+                da = da.clip(min=-clip_abs, max=clip_abs)
+                return da.astype(np.float32)
+
+            varr_mc = _sanitize_da(varr_mc)
+            A_init = _sanitize_da(A_init)
+            C_init = _sanitize_da(C_init)
+
+            # 4.1) 关键修复：保证 DataArray 具有稳定 name，避免 update_spatial 里
+            # C_path = intpath/C.name.zarr/C.name 出现 shape is None
+            if not getattr(varr_mc, "name", None):
+                varr_mc = varr_mc.rename("varr_mc")
+            if not getattr(A_init, "name", None):
+                A_init = A_init.rename("A_init")
+            if not getattr(C_init, "name", None):
+                C_init = C_init.rename("C_init")
+            if not getattr(sn_spatial, "name", None):
+                sn_spatial = sn_spatial.rename("sn_spatial")
+
+            # sn_spatial 必须为有限且正值，避免后续归一化/回归出现非法值
+            sn_spatial = xr.where(np.isfinite(sn_spatial), sn_spatial, np.float32(1e-6))
+            sn_spatial = xr.where(sn_spatial > 0, sn_spatial, np.float32(1e-6)).astype(np.float32)
+
+            # 将修复后的对象写回仓库，保证后续步骤一致
+            self._save_data_to_repo(varr_mc, "varr_mc")
+            self._save_data_to_repo(A_init, "A_init")
+            self._save_data_to_repo(C_init, "C_init")
+            self._save_data_to_repo(sn_spatial, "sn_spatial")
+
             params = self.get_step_params(step_name)
-            spatial_kwargs = params.get('spatial_kwargs', {})
 
-            # --- 第一次空间更新 ---
-            self.log_output.append("-> 正在执行第一次空间更新...")
-            A_new, mask, norm_fac = update_spatial(
-                varr_mc, A_init, C_init, sn_spatial, **spatial_kwargs
+            # 4.2) 关键修复：在 in_memory=False 时，确保 C_init 对应 zarr 已存在。
+            # 否则 update_spatial 的 zarr.open_array(C_path) 会因找不到 shape 报错。
+            if not params.get("in_memory", False):
+                intpath = os.environ.get("MINIAN_INTERMEDIATE")
+                if intpath:
+                    try:
+                        save_minian(C_init.rename(C_init.name or "C_init"), dpath=intpath, overwrite=True)
+                    except Exception as _e:
+                        self.log_output.append(f"⚠️ C_init 预落盘失败: {_e}")
+
+            penalty_list = (
+                params.get("sparse_penalty_list")
+                or params.get("sparse_penal_list")
+                or params.get("sparse_penalty")
+                or params.get("sparse_penal")
             )
-
-            C_new = (C_init.sel(unit_id=mask) * norm_fac).rename("C_new")
-            C_new = save_minian(C_new, intpath, overwrite=True)
-            self._save_data_to_repo(C_new, "C_new_iter1")
-
-            C_chk_new = (C_chk_init.sel(unit_id=mask) * norm_fac).rename("C_chk_new")
-            C_chk_new = save_minian(C_chk_new, intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_new, "C_chk_new_iter1")
-
-            # --- 背景更新 ---
-            self.log_output.append("-> 正在执行背景更新...")
-            b_new, f_new = update_background(varr_mc, A_new, C_chk_new)
             
-            # --- 可视化 (2x2 空间足迹对比) ---
-            self.log_output.append("-> 正在生成空间更新可视化结果 (Matplotlib 2x2)。")
-            
-            # 1. 准备数据 (计算 Dask 数组并转换为 NumPy)
-            A_init_max = A_init.max("unit_id").compute().astype(np.float32).values
-            A_init_sum = (A_init.fillna(0) > 0).sum("unit_id").compute().astype(np.uint8).values
-            A_new_max = A_new.max("unit_id").compute().astype(np.float32).values
-            A_new_sum = (A_new > 0).sum("unit_id").compute().astype(np.uint8).values
-            
-            # 2. 调用新的可视化函数
-            img_array = create_spatial_update_plot(
-                A_init_max, 
-                A_init_sum, 
-                A_new_max, 
-                A_new_sum, 
-                step_name="First Update" # 传入 step_name 区分
-            )
+            # print("DEBUG:Parameters loaded successfully.")
+            # print(f"DEBUG:Detailed parameters: {params}")
 
-            # 3. 保存 NumPy 数组供 PyQt 显示
-            self._save_data_to_repo(img_array, f"{step_name}_vis_array")
-            
-            # --- 保存最终结果并更新 repo 中的主键 ---
-            self.log_output.append("-> 正在保存 A, C, b, f 的第一次迭代结果...")
+            if isinstance(penalty_list, (int, float)):
+                penalty_list = [float(penalty_list)]
+            if not penalty_list:
+                penalty_list = [0.1, 0.3, 0.5, 1.0]
 
-            A = save_minian(
-                A_new.rename("A"),
-                intpath,
-                overwrite=True,
-                chunks=params.get('A_chunks', {"unit_id": 1, "height": -1, "width": -1}),
-            )
-            self._save_data_to_repo(A, "A_iter1")
-            
-            b = save_minian(b_new.rename("b"), intpath, overwrite=True)
-            self._save_data_to_repo(b, "b_iter1")
+            dl_wnd = params.get("dl_wnd", 5)
+            update_background = params.get("update_background", False)
+            normalize = params.get("normalize", True)
+            size_thres_raw = params.get("size_thres", (9, None))
+            size_thres = self._normalize_size_thres(size_thres_raw)
+            in_memory = params.get("in_memory", False)
 
-            f = save_minian(
-                f_new.chunk({"frame": chk["frame"]}).rename("f"), intpath, overwrite=True
-            )
-            self._save_data_to_repo(f, "f_iter1")
+            # 诊断：检查当前输入 footprint 面积分布，判断是否会被 size_thres 全部过滤
+            try:
+                area_init = (A_init > 0).sum(["height", "width"]).compute().values
+                area_init = np.asarray(area_init, dtype=np.float32)
+                low = size_thres[0] if isinstance(size_thres, (list, tuple)) and len(size_thres) > 0 else None
+                if area_init.size > 0:
+                    msg = (
+                        f"[DIAG] {step_name} 输入面积统计: min={float(np.nanmin(area_init)):.2f}, "
+                        f"median={float(np.nanmedian(area_init)):.2f}, max={float(np.nanmax(area_init)):.2f}, "
+                        f"size_thres={size_thres}"
+                    )
+                    self.log_output.append(msg)
+                    if low is not None:
+                        keep_cnt = int((area_init > float(low)).sum())
+                        self.log_output.append(
+                            f"[DIAG] {step_name} 预估通过 low 阈值({low})的单元数: {keep_cnt}/{int(area_init.size)}"
+                        )
+            except Exception as _diag_err:
+                self.log_output.append(f"[DIAG] {step_name} 面积统计失败: {_diag_err}")
 
-            C = save_minian(C_new.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C, "C_iter1")
+            result_map = {}
+            failed_penalties = []
+            logs = [
+                "estimating penalty parameter",
+                "computing subsetting matrix",
+                "fitting spatial matrix",
+            ]
 
-            C_chk = save_minian(C_chk_new.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk, "C_chk_iter1")
+            for pen in penalty_list:
+                self.log_output.append(f"-> 正在探索 sparse_penalty = {pen}")
+                print(f"DEBUG:-> 正在探索 sparse_penalty = {pen}")
 
-            self.log_output.append("✅ 步骤 11 运行完成。")
+                try:
+                    ret = update_spatial(
+                        varr_mc,
+                        A_init,
+                        C_init,
+                        sn_spatial,
+                        b = b_init,
+                        f = f_init,
+                        dl_wnd=dl_wnd,
+                        sparse_penal=float(pen),
+                        update_background=update_background,
+                        normalize=normalize,
+                        size_thres=size_thres,
+                        in_memory=in_memory,
+                    )
+                except Exception as pen_err:
+                    # 兜底：磁盘模式失败时，自动用内存模式再试一次
+                    if not in_memory:
+                        self.log_output.append(
+                            f"⚠️ sparse_penalty={pen} 磁盘模式失败，改用 in_memory=True 重试"
+                        )
+                        try:
+                            ret = update_spatial(
+                                varr_mc,
+                                A_init,
+                                C_init,
+                                sn_spatial,
+                                dl_wnd=dl_wnd,
+                                sparse_penal=float(pen),
+                                update_background=update_background,
+                                normalize=normalize,
+                                size_thres=size_thres,
+                                in_memory=True,
+                            )
+                        except Exception as pen_err2:
+                            pen_tb = traceback.format_exc()
+                            msg = f"sparse_penalty={pen} 失败(含内存重试): {pen_err2}"
+                            self.log_output.append("❌ " + msg)
+                            self.log_output.append(pen_tb)
+                            print(f"[ERROR] {step_name}::{msg}\n{pen_tb}")
+                            failed_penalties.append(msg)
+                            continue
+                    else:
+                        pen_tb = traceback.format_exc()
+                        msg = f"sparse_penalty={pen} 失败: {pen_err}"
+                        self.log_output.append("❌ " + msg)
+                        self.log_output.append(pen_tb)
+                        print(f"[ERROR] {step_name}::{msg}\n{pen_tb}")
+                        failed_penalties.append(msg)
+                        continue
+                
+                # print("DEBUG:Update spatial finished.")
+
+                A_new = ret[0]
+                mask = ret[1]
+                extra = ret[2:]
+
+                norm_fac = None
+                b_new = None
+                if update_background and normalize:
+                    b_new, norm_fac = extra
+                elif update_background:
+                    b_new = extra[0]
+                elif normalize:
+                    norm_fac = extra[0]
+
+                dropped = int(len(mask) - mask.sum().values)
+                units_total = int(len(mask))
+                log_lines = logs + [f"{dropped} out of {units_total} units dropped"]
+
+                kept_n = int(mask.sum().values)
+                if kept_n == 0:
+                    # 若当前 size_thres 过严导致全部被过滤，自动放宽后重试一次
+                    cur_low, cur_high = (size_thres[0], size_thres[1]) if isinstance(size_thres, (list, tuple)) and len(size_thres) >= 2 else (None, None)
+                    if cur_low is not None and float(cur_low) > 1:
+                        relaxed_size_thres = (1, cur_high)
+                        self.log_output.append(
+                            f"⚠️ sparse_penalty={pen} 过滤后无可用单元，自动放宽 size_thres={relaxed_size_thres} 重试"
+                        )
+                        try:
+                            ret_relaxed = update_spatial(
+                                varr_mc,
+                                A_init,
+                                C_init,
+                                sn_spatial,
+                                dl_wnd=dl_wnd,
+                                sparse_penal=float(pen),
+                                update_background=update_background,
+                                normalize=normalize,
+                                size_thres=relaxed_size_thres,
+                                in_memory=True if not in_memory else in_memory,
+                            )
+                            A_new = ret_relaxed[0]
+                            mask = ret_relaxed[1]
+                            dropped = int(len(mask) - mask.sum().values)
+                            units_total = int(len(mask))
+                            log_lines = logs + [
+                                f"{dropped} out of {units_total} units dropped (relaxed_size_thres={relaxed_size_thres})"
+                            ]
+                            kept_n = int(mask.sum().values)
+                        except Exception as re_err:
+                            self.log_output.append(f"❌ sparse_penalty={pen} 放宽阈值重试失败: {re_err}")
+
+                if kept_n == 0:
+                    msg = f"sparse_penalty={pen} 过滤后无可用单元(mask 全 False)"
+                    self.log_output.append("❌ " + msg)
+                    failed_penalties.append(msg)
+                    continue
+
+                # 给 temporal 面板准备 10 个 unit
+                kept_units = A_new.coords["unit_id"].values
+                sample_n = min(10, len(kept_units))
+                sample_units = kept_units[:sample_n]
+
+                A_sample = A_new.sel(unit_id=sample_units).compute()
+                C_sample = C_init.sel(unit_id=sample_units).compute()
+
+                result_map[float(pen)] = {
+                    "penalty": float(pen),
+                    "A_new": A_new,
+                    "mask": mask,
+                    "norm_fac": norm_fac,
+                    "b_new": b_new,
+                    "A_sample": A_sample,
+                    "C_sample": C_sample,
+                    "log_lines": log_lines,
+                }
+
+            if not result_map:
+                raise RuntimeError(
+                    "first_spatial_update_explore 所有参数探索均失败。\n" + "\n".join(failed_penalties)
+                )
+
+            ok_penalties = sorted(list(result_map.keys()))
+
+            result = {
+                "mode": "single",
+                "penalty_list": ok_penalties,
+                "results": result_map,
+                "default_penalty": float(ok_penalties[0]),
+            }
+
+            self.exploration_results[step_name] = result
+            self.steps_results[step_name] = result
             self.update_step_status(step_name, "已完成")
-            return True
+            return result
 
         except Exception as e:
+            tb = traceback.format_exc()
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            self.log_output.append(tb)
+            print(f"[ERROR] {step_name} 顶层异常: {e}\n{tb}")
+            self._save_data_to_repo(
+                {
+                    "step": step_name,
+                    "error": str(e),
+                    "traceback": tb,
+                },
+                f"{step_name}_last_error",
+            )
             self.update_step_status(step_name, "错误")
-            return False
+            return None
+
+    # second_spatial_update_explore 已移除
 
     # 请注意： run_first_temporal_update_explore (步骤 12) 保持不变，因为它使用 Holoviews/Bokeh 风格的 visualize_temporal_update
     # 假设 create_cnmf_update_plot, compute_trace, update_temporal 等已导入
 
-    def run_first_temporal_update_explore(self) -> bool:
+    def run_first_temporal_update_explore(self) -> dict:
         """
-        步骤 12: 初次时间更新 (参数探索) - 修改为 Matplotlib 单个单元四宫格图
+        初次时间更新参数探索：对给定 sparse_penalty 列表逐一执行 update_temporal，
+        产出与 spatial explore 一致的可交互结果结构（single/compare）。
         """
         step_name = 'first_temporal_update_explore'
         self.update_step_status(step_name, "运行中")
         try:
-            # 1. 加载数据
-            varr_mc = self._load_data_from_repo('varr_mc') # 对应 Y_fm_chk
-            A_init = self._load_data_from_repo('A_init') # 对应 A
-            C_init = self._load_data_from_repo('C_init') # 对应 C_chk
-            
-            b_current = self._load_data_from_repo('b_iter1', allow_none=True)
-            f_current = self._load_data_from_repo('f_iter1', allow_none=True)
-            # ... (b_current/f_current 初始化代码不变) ...
+            varr_mc_raw = self._load_data_from_repo('varr_mc')
+            varr_mc = varr_mc_raw[1] if isinstance(varr_mc_raw, tuple) else varr_mc_raw
+
+            A_src = self._load_data_from_repo('A_iter1')
+            C_src = self._load_data_from_repo('C_iter1')
+            C_chk_src = self._load_data_from_repo('C_chk_iter1')
+            b_current = self._load_data_from_repo('b_iter1')
+            f_current = self._load_data_from_repo('f_iter1')
+
+            # 兼容测试链路：若 iter1 尚未生成，回退 init
+            if A_src is None:
+                A_src = self._load_data_from_repo('A_init')
+            if C_src is None:
+                C_src = self._load_data_from_repo('C_init')
+            if C_chk_src is None:
+                C_chk_src = C_src
+
+            if varr_mc is None or A_src is None or C_src is None:
+                raise ValueError("缺少 first_temporal_update_explore 所需输入(varr_mc/A/C)")
+
+            required_dims = {"frame", "height", "width"}
+            if not required_dims.issubset(set(getattr(varr_mc, "dims", ()))):
+                raise ValueError(
+                    f"varr_mc 维度异常，期望包含 {sorted(required_dims)}，实际为 {getattr(varr_mc, 'dims', None)}"
+                )
+
             if b_current is None:
                 b_current = xr.zeros_like(varr_mc.isel(frame=0, drop=True)).rename("b")
             if f_current is None:
-                f_current = xr.zeros_like(varr_mc.isel(height=0, width=0).mean(dim=["height", "width"], drop=True)).rename("f")
+                if {"height", "width"}.issubset(set(getattr(varr_mc, "dims", ()))):
+                    f_current = xr.zeros_like(varr_mc.isel(height=0, width=0, drop=True)).rename("f")
+                else:
+                    # 兜底：若输入已是一维 frame 序列，则直接按其形状初始化背景时间项
+                    f_current = xr.zeros_like(varr_mc).rename("f")
 
-            # 2. 获取单个参数组合
+            if "unit_id" in A_src.coords and "unit_id" in C_src.coords:
+                common_units = np.intersect1d(A_src.coords["unit_id"].values, C_src.coords["unit_id"].values)
+                if len(common_units) == 0:
+                    raise ValueError("A 与 C 没有公共 unit_id")
+                A_src = A_src.sel(unit_id=common_units)
+                C_src = C_src.sel(unit_id=common_units)
+                if C_chk_src is not None and "unit_id" in C_chk_src.coords:
+                    chk_units = np.intersect1d(common_units, C_chk_src.coords["unit_id"].values)
+                    C_chk_src = C_chk_src.sel(unit_id=chk_units)
+
             params = self.get_step_params(step_name)
-            p = params.get('p', 1)
-            sparse_penal = params.get('sparse_penal', 1.0)
-            add_lag = params.get('add_lag', 20)
-            noise_freq = params.get('noise_freq', 0.06)
+            penalty_list = (
+                params.get('sparse_penalty_list')
+                or params.get('sparse_penal_list')
+                or params.get('exploration_penalties')
+                or params.get('sparse_penalty')
+                or params.get('sparse_penal')
+            )
+            if isinstance(penalty_list, (int, float)):
+                penalty_list = [float(penalty_list)]
+            if not penalty_list:
+                penalty_list = [0.001, 0.01, 0.1]
 
-            # 3. 选取子集单位 (Units)
-            self.log_output.append("-> 正在选取 10 个随机单位进行时间更新探索。")
-            all_units = A_init.coords["unit_id"].values
-            units_to_select = min(10, len(all_units))
-            np.random.seed(1) 
-            units = np.random.choice(all_units, units_to_select, replace=False)
-            units.sort()
-            
-            A_sub = A_init.sel(unit_id=units).persist()
-            C_sub = C_init.sel(unit_id=units).persist()
-            
-            # 4. 计算残差 (YrA)
+            p = int(params.get('p', 1))
+            add_lag = params.get('add_lag', 'p')
+            noise_freq = float(params.get('noise_freq', 0.06))
+            use_smooth = bool(params.get('use_smooth', True))
+
+            all_units = A_src.coords["unit_id"].values
+            units_to_select = min(int(params.get('sample_units', 10)), len(all_units))
+            if units_to_select <= 0:
+                raise ValueError("可用于 temporal explore 的 unit 数量为 0")
+
+            np.random.seed(int(params.get('random_seed', 11)))
+            sample_units = np.random.choice(all_units, units_to_select, replace=False)
+            sample_units.sort()
+
+            # 注意：temporal explore 不应就地污染前序步骤数据。
+            # 这里先做深拷贝，确保后续 update_temporal 不会改写 repo 中对象。
+            A_sub = A_src.sel(unit_id=sample_units).fillna(0).astype(np.float32).copy(deep=True).persist()
+            C_sub = C_src.sel(unit_id=sample_units).fillna(0).astype(np.float32).copy(deep=True).persist()
+            C_chk_sub = C_chk_src.sel(unit_id=sample_units).fillna(0).astype(np.float32).copy(deep=True).persist()
+
+            # 代表性单元：默认选择 C 均值最大的单元，可通过配置 temporal_focus_unit_id 覆盖
+            temporal_focus_unit = params.get('temporal_focus_unit_id', None)
+            if temporal_focus_unit is None:
+                c_mean = C_sub.mean(dim='frame').compute().values
+                focus_idx = int(np.argmax(c_mean)) if len(c_mean) > 0 else 0
+                temporal_focus_unit = int(sample_units[focus_idx])
+            else:
+                temporal_focus_unit = int(temporal_focus_unit)
+                if temporal_focus_unit not in set(sample_units.tolist()):
+                    temporal_focus_unit = int(sample_units[0])
+
+            # 从 MC 后视频提取该单元的原始曲线（加权平均）
+            A_focus = A_sub.sel(unit_id=temporal_focus_unit).fillna(0).astype(np.float32)
+            w = A_focus / (A_focus.sum() + np.float32(1e-6))
+            raw_mc_trace = (varr_mc * w).sum(dim=['height', 'width']).compute().values.astype(np.float32)
+
+            self.log_output.append(f"-> temporal explore 采样单元数: {len(sample_units)}")
             self.log_output.append("-> 正在计算 YrA (残差/trace)...")
-            # 假设 compute_trace 返回 Y_rA (即 Y - b*f) 减去单位本身贡献后的信号
-            # Minian 的 compute_trace 实际上是 (Y - b*f) * A.T
-            # 这里为了演示，我们假设它返回了正确的输入信号 (Y_rA)
-            YrA = compute_trace(
-                varr_mc, A_sub, b_current, C_sub, f_current
-            ).persist().chunk({"unit_id": 1, "frame": -1})
-            
-            self.log_output.append(f"-> 执行探索 (p={p}, sparse_penal={sparse_penal}, add_lag={add_lag}, noise_freq={noise_freq})...")
+            YrA = compute_trace(varr_mc, A_sub, b_current, C_chk_sub, f_current).copy(deep=True).persist()
 
-            # 5. 运行 update_temporal (单参数)
-            cur_C, cur_S, cur_b0, cur_c0, cur_g, cur_mask = update_temporal(
-                A_sub,
-                C_sub,
-                YrA=YrA,
-                sparse_penal=sparse_penal,
-                p=p,
-                use_smooth=True,
-                add_lag=add_lag,
-                noise_freq=noise_freq,
-            )
-            
-            # 6. 可视化：使用 create_cnmf_update_plot (替代方案)
-            self.log_output.append("-> 正在生成时间更新可视化结果 (Matplotlib/代表性单元)。")
-            
-            # 选取一个代表性 Unit ID (例如第一个)
-            representative_unit_id = units[0]
-            # 选取一个代表性帧
-            frame_idx = 0 
-            
-            # 为了 create_cnmf_update_plot，我们需要 A, C, S 的 Xarray DataArray
-            # 注意：这里我们无法直接显示 C 与 YrA 的对比，只能显示 C 本身 (即四宫格图的 C 图)
-            img_array = create_cnmf_update_plot(
-                varr=self.Y_ds, # 假设 self.Y_ds 是原始视频，用于背景
-                A_comp=A_sub.compute(), 
-                C_comp=cur_C.compute(), 
-                S_comp=cur_S.compute(), 
-                unit_id=representative_unit_id, 
-                frame_idx=frame_idx
-            )
-            
-            # 7. 保存图像
-            image_path = f"{step_name}_temporal_cnmf_plot.png"
-            full_path = os.path.join(self.repo_dir, image_path)
-            cv2.imwrite(full_path, cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)) 
-            self._save_data_to_repo(image_path, f"{step_name}_vis")
-            
-            self.log_output.append("✅ 步骤 12 运行完成。")
+            result_map = {}
+            failed_penalties = []
+            for pen in penalty_list:
+                self.log_output.append(f"-> 正在探索 temporal sparse_penalty = {pen}")
+                try:
+                    # 每个 penalty 使用独立副本，防止一个参数运行后影响下一个参数
+                    A_in = A_sub.copy(deep=True)
+                    C_in = C_sub.copy(deep=True)
+                    YrA_in = YrA.copy(deep=True)
+
+                    cur_C, cur_S, cur_b0, cur_c0, cur_g, cur_mask = update_temporal(
+                        A_in,
+                        C_in,
+                        YrA=YrA_in,
+                        sparse_penal=float(pen),
+                        p=p,
+                        use_smooth=use_smooth,
+                        add_lag=add_lag,
+                        noise_freq=noise_freq,
+                    )
+                except Exception as pen_err:
+                    # 二次尝试：使用更保守参数，避免单个参数类型/数值导致全失败
+                    try:
+                        cur_C, cur_S, cur_b0, cur_c0, cur_g, cur_mask = update_temporal(
+                            A_in,
+                            C_in,
+                            YrA=YrA_in,
+                            sparse_penal=float(pen),
+                            p=max(1, p),
+                            use_smooth=False,
+                            add_lag='p',
+                            noise_freq=noise_freq,
+                        )
+                        self.log_output.append(f"⚠️ sparse_penalty={pen} 首次失败，已用保守参数重试成功")
+                    except Exception as pen_err_2:
+                        msg = f"sparse_penalty={pen} 失败: {pen_err}; retry失败: {pen_err_2}"
+                        self.log_output.append("❌ " + msg)
+                        failed_penalties.append(msg)
+                        continue
+
+                # update_temporal 可能筛掉部分 unit，直接 sel 会触发 KeyError。
+                # 这里统一重建到 sample_units 轴，缺失单元以 0 填充，保证可视化结构稳定。
+                C_show = cur_C.reindex(unit_id=sample_units).fillna(np.float32(0)).compute().astype(np.float32)
+                S_show = cur_S.reindex(unit_id=sample_units).fillna(np.float32(0)).compute().astype(np.float32)
+                C_ref = C_sub.compute().astype(np.float32)
+                mask_kept = int(cur_mask.sum().values) if hasattr(cur_mask, "sum") else len(sample_units)
+
+                if "unit_id" in cur_C.coords and temporal_focus_unit in set(cur_C.coords["unit_id"].values.tolist()):
+                    focus_uid = int(temporal_focus_unit)
+                elif "unit_id" in cur_C.coords and cur_C.sizes.get("unit_id", 0) > 0:
+                    focus_uid = int(cur_C.coords["unit_id"].values[0])
+                    self.log_output.append(
+                        f"⚠️ sparse_penalty={pen} 下 focus unit {temporal_focus_unit} 被筛除，已回退到 {focus_uid}"
+                    )
+                else:
+                    focus_uid = int(temporal_focus_unit)
+
+                c_after_trace = cur_C.reindex(unit_id=[focus_uid]).fillna(np.float32(0)).isel(unit_id=0).compute().values.astype(np.float32)
+                fit_trace = (
+                    (cur_C + cur_b0 + cur_c0)
+                    .reindex(unit_id=[focus_uid])
+                    .fillna(np.float32(0))
+                    .isel(unit_id=0)
+                    .compute()
+                    .values
+                    .astype(np.float32)
+                )
+                spike_trace = cur_S.reindex(unit_id=[focus_uid]).fillna(np.float32(0)).isel(unit_id=0).compute().values.astype(np.float32)
+
+                result_map[float(pen)] = {
+                    "penalty": float(pen),
+                    "C_before": C_ref,
+                    "C_after": C_show,
+                    "S_after": S_show,
+                    "focus_unit": int(focus_uid),
+                    "c_after_trace": c_after_trace,
+                    "raw_mc_trace": raw_mc_trace,
+                    "fit_trace": fit_trace,
+                    "spike_trace": spike_trace,
+                    "sample_units": sample_units.tolist(),
+                    "log_lines": [
+                        f"p={p}",
+                        f"add_lag={add_lag}",
+                        f"noise_freq={noise_freq}",
+                        f"use_smooth={use_smooth}",
+                        f"kept_units={mask_kept}",
+                    ],
+                }
+
+            if not result_map:
+                self.log_output.append("⚠️ temporal explore 所有参数失败，回退为原始 C 曲线可视化结果。")
+                c_ref = C_sub.compute().astype(np.float32)
+                uid0 = int(sample_units[0])
+                c_trace = c_ref.sel(unit_id=uid0).values.astype(np.float32)
+                z = np.zeros_like(c_trace, dtype=np.float32)
+                for pen in penalty_list:
+                    result_map[float(pen)] = {
+                        "penalty": float(pen),
+                        "C_before": c_ref,
+                        "C_after": c_ref,
+                        "S_after": xr.zeros_like(c_ref),
+                        "focus_unit": uid0,
+                        "c_after_trace": c_trace,
+                        "raw_mc_trace": c_trace,
+                        "fit_trace": c_trace,
+                        "spike_trace": z,
+                        "sample_units": sample_units.tolist(),
+                        "log_lines": [
+                            "fallback=true",
+                            f"failed_count={len(failed_penalties)}",
+                        ],
+                    }
+
+            ok_penalties = sorted(list(result_map.keys()))
+            result = {
+                "mode": "single",
+                "penalty_list": ok_penalties,
+                "results": result_map,
+                "default_penalty": float(ok_penalties[0]),
+            }
+
+            self.exploration_results[step_name] = result
+            self.steps_results[step_name] = result
             self.update_step_status(step_name, "已完成")
-            return True
+            return result
+
         except Exception as e:
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            self.log_output.append(traceback.format_exc())
             self.update_step_status(step_name, "错误")
-            return False
+            return None
 
-    def run_first_temporal_update(self) -> bool:
-        """
-        步骤 13: 第一次时间更新 (Update Temporal) 和单位合并 (Unit Merge)
-        更新 A, C, S, b0, c0 的新值。
-        """
-        step_name = 'first_temporal_update'
+    # second_temporal_update_explore 已移除
+
+    def _resolve_temporal_exec_penalty(self, explore_step_name: str, params: dict) -> float:
+        exp_data = self.get_exploration_result(explore_step_name)
+        exp_state = self.get_exploration_state(explore_step_name)
+
+        if exp_data and exp_data.get("results"):
+            keys = sorted([float(k) for k in exp_data["results"].keys()])
+            selected = exp_state.get("selected_penalty", exp_data.get("default_penalty", keys[0]))
+            try:
+                selected = float(selected)
+                return min(keys, key=lambda x: abs(x - selected))
+            except Exception:
+                return float(keys[0])
+
+        p = (
+            params.get("sparse_penalty")
+            or params.get("sparse_penal")
+            or params.get("sparse_penalty_list")
+            or params.get("sparse_penal_list")
+            or params.get("exploration_penalties")
+            or 0.1
+        )
+        if isinstance(p, (list, tuple)) and len(p) > 0:
+            try:
+                return float(p[0])
+            except Exception:
+                return 0.1
+        try:
+            return float(str(p))
+        except Exception:
+            return 0.1
+
+    def _run_temporal_update_exec_common(
+        self,
+        step_name: str,
+        explore_step_name: str,
+        a_key: str,
+        c_key: str,
+        c_chk_key: str,
+        b_key: str,
+        f_key: str,
+        vis_step_title: str,
+        output_a_mrg_key: Optional[str] = None,
+        output_c_mrg_key: Optional[str] = None,
+        output_c_chk_mrg_key: Optional[str] = None,
+        output_sig_mrg_key: Optional[str] = None,
+    ) -> bool:
         self.update_step_status(step_name, "运行中")
         try:
-            # 1. 加载数据 (使用迭代 1 的结果)
             intpath = os.environ.get("MINIAN_INTERMEDIATE", "./intermediate_data")
-            varr_mc = self._load_data_from_repo('varr_mc')
-            A_current = self._load_data_from_repo('A_iter1')
-            C_current = self._load_data_from_repo('C_iter1')
-            C_chk_current = self._load_data_from_repo('C_chk_iter1')
-            b_current = self._load_data_from_repo('b_iter1')
-            f_current = self._load_data_from_repo('f_iter1')
-            chk = self._load_data_from_repo('chk_settings') 
-            
-            params = self.get_step_params(step_name)
-            temporal_kwargs = params.get('temporal_kwargs', {})
-            merge_kwargs = params.get('merge_kwargs', {}) # 确保获取 merge_kwargs
+            diag_bundle: Dict[str, Any] = {}
 
-            # --- 计算 YrA ---
-            self.log_output.append("-> 正在计算 YrA (残差/trace)...")
-            YrA = compute_trace(
-                varr_mc, A_current, b_current, C_chk_current, f_current
-            ).persist() 
+            varr_mc_raw = self._load_data_from_repo("varr_mc")
+            varr_mc = varr_mc_raw[1] if isinstance(varr_mc_raw, tuple) else varr_mc_raw
+            A_current = self._load_data_from_repo(a_key)
+            C_current = self._load_data_from_repo(c_key)
+            C_chk_current = self._load_data_from_repo(c_chk_key)
+            b_current = self._load_data_from_repo(b_key)
+            f_current = self._load_data_from_repo(f_key)
 
-            # --- 第一次时间更新 ---
-            self.log_output.append("-> 正在执行第一次时间更新...")
-            C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
-                A_current, C_current, YrA=YrA, **temporal_kwargs
+            if varr_mc is None or A_current is None or C_current is None:
+                raise ValueError(f"缺少 temporal update 输入(varr_mc/{a_key}/{c_key})")
+
+            # 与 explore 一致的预处理：frame 单块 + 数值清理
+            varr_mc = varr_mc.chunk({"frame": -1}).fillna(0).astype(np.float32)
+            A_current = A_current.fillna(0).astype(np.float32)
+            C_current = C_current.chunk({"frame": -1}).fillna(0).astype(np.float32)
+
+            if C_chk_current is None:
+                C_chk_current = C_current
+            C_chk_current = C_chk_current.chunk({"frame": -1}).fillna(0).astype(np.float32)
+
+            if "unit_id" in A_current.coords and "unit_id" in C_current.coords:
+                common_units = np.intersect1d(A_current.coords["unit_id"].values, C_current.coords["unit_id"].values)
+                if len(common_units) == 0:
+                    raise ValueError(f"{a_key}/{c_key} 无公共 unit_id")
+                A_current = A_current.sel(unit_id=common_units)
+                C_current = C_current.sel(unit_id=common_units)
+
+            # 详细诊断：temporal update 输入质量
+            diag_bundle["A_current_before_temporal"] = self._diagnose_da(
+                A_current, f"{step_name}:A_current_before_temporal", per_unit=True
             )
-            
-            C_new = C_new.rename("C_new")
-            C_chk_new = C_chk_current.sel(unit_id=C_new.coords["unit_id"].values).rename("C_chk_new") # 调整 C_chk_new 的大小
-
-            # --- 可视化 (初始/第一次更新 C/S 矩阵图) ---
-            self.log_output.append("-> 正在生成时间更新和事件的矩阵可视化结果。")
-            
-            C_init_comp = C_current.compute().astype(np.float32).values
-            C_new_comp = C_new.compute().astype(np.float32).values
-            S_new_comp = S_new.compute().astype(np.float32).values
-            
-            # 调用新的 C/S 矩阵可视化函数
-            img_array_c_s = create_temporal_matrix_plot(
-                C_init_comp, 
-                C_new_comp, 
-                S_new_comp, 
-                step_name="First Update"
+            diag_bundle["C_current_before_temporal"] = self._diagnose_da(
+                C_current, f"{step_name}:C_current_before_temporal", per_unit=True
             )
-            self._save_data_to_repo(img_array_c_s, f"{step_name}_c_s_vis_array")
-            
-            # --- 可视化 (接受单位的细节) ---
-            self.log_output.append("-> 正在生成接受单位的详细时间更新可视化 (10个样本)。")
-            sig = C_new + b0_new + c0_new
-            
-            accepted_units = C_new.coords["unit_id"].values
-            units_to_sample = min(10, len(accepted_units))
-            np.random.seed(2) 
-            sample_units = np.random.choice(accepted_units, units_to_sample, replace=False)
-            
-            A_comp = A_current.sel(unit_id=sample_units).compute()
-            C_comp = C_new.sel(unit_id=sample_units).compute()
-            S_comp = S_new.sel(unit_id=sample_units).compute()
-            
-            # 找到平均C最大的帧作为重建帧
-            mean_C_idx = int(C_comp.mean('unit_id').argmax().values)
-            
-            # 为每个样本单位创建并保存详细四宫格图
-            for i, unit_id in enumerate(sample_units):
-                img_array_unit = create_cnmf_update_plot(
-                    varr_mc, 
-                    A_comp, 
-                    C_comp, 
-                    S_comp, 
-                    unit_id, 
-                    mean_C_idx
+
+            # C_chk 必须与 C_current 的 unit 轴严格一致，否则 compute_trace 会失败
+            if "unit_id" in C_chk_current.coords:
+                C_chk_current = (
+                    C_chk_current
+                    .reindex(unit_id=C_current.coords["unit_id"].values)
+                    .fillna(np.float32(0))
+                    .astype(np.float32)
                 )
-                self._save_data_to_repo(img_array_unit, f"{step_name}_accepted_unit_{unit_id}_vis_array")
 
+            b_template = varr_mc.isel(frame=0, drop=True).rename("b")
+            if b_current is None or not {"height", "width"}.issubset(set(getattr(b_current, "dims", ()))):
+                b_current = xr.zeros_like(b_template)
+            else:
+                b_current = b_current.reindex_like(b_template).fillna(np.float32(0)).astype(np.float32).rename("b")
 
-            # --- 临时保存 C, C_chk, S, b0, c0 ---
-            self.log_output.append("-> 正在保存时间更新结果...")
-            
-            C_current = save_minian(C_new.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C_current, "C_tmp_merge")
+            f_template = varr_mc.isel(height=0, width=0, drop=True).rename("f")
+            if f_current is None or "frame" not in set(getattr(f_current, "dims", ())):
+                f_current = xr.zeros_like(f_template)
+            else:
+                f_current = (
+                    f_current
+                    .reindex(frame=f_template.coords["frame"])
+                    .fillna(np.float32(0))
+                    .astype(np.float32)
+                    .rename("f")
+                )
 
-            C_chk_current = save_minian(C_chk_new.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_current, "C_chk_tmp_merge")
+            params = dict(self.get_step_params(explore_step_name) or {})
+            exec_params = self.get_step_params(step_name)
+            params.update(exec_params if exec_params else {})
 
-            S_current = save_minian(S_new.rename("S"), intpath, overwrite=True)
-            self._save_data_to_repo(S_current, "S_tmp_merge")
+            sparse_pen = self._resolve_temporal_exec_penalty(explore_step_name, params)
+            p = int(params.get("p", 1))
+            add_lag = params.get("add_lag", "p")
+            noise_freq = float(params.get("noise_freq", 0.06))
+            use_smooth = bool(params.get("use_smooth", True))
 
-            b0_current = save_minian(b0_new.rename("b0"), intpath, overwrite=True)
-            self._save_data_to_repo(b0_current, "b0_tmp_merge")
-            
-            c0_current = save_minian(c0_new.rename("c0"), intpath, overwrite=True)
-            self._save_data_to_repo(c0_current, "c0_tmp_merge")
-            
-            A_current = A_current.sel(unit_id=C_current.coords["unit_id"].values)
-            self._save_data_to_repo(A_current, "A_tmp_merge")
+            merge_kwargs = params.get("merge_kwargs") or {}
 
-            # --- 单位合并 ---
-            self.log_output.append("-> 正在执行单位合并...")
-            A_mrg, C_mrg, sig_mrg_list = unit_merge(
-                A_current, 
-                C_current, 
-                [C_current + b0_current + c0_current], 
-                **merge_kwargs
+            self.log_output.append(f"-> {step_name} 使用 sparse_penalty={sparse_pen}")
+            self.log_output.append("-> 正在计算 YrA (残差/trace)...")
+            YrA = compute_trace(varr_mc, A_current, b_current, C_chk_current, f_current).persist()
+
+            YrA_saved = save_minian(
+                YrA.rename("YrA"),
+                intpath,
+                overwrite=True,
+                chunks={"unit_id": 1, "frame": -1},
             )
-            sig_mrg = sig_mrg_list[0] 
+            self._save_data_to_repo(YrA_saved, f"{step_name}_YrA")
 
-            # --- 合并可视化 (C 矩阵图对比) ---
-            self.log_output.append("-> 正在生成合并对比可视化。")
-            
-            C_before_comp = C_current.compute().astype(np.float32).values
-            C_after_comp = C_mrg.compute().astype(np.float32).values
-            
-            # 调用新的合并矩阵可视化函数
+            self.log_output.append("-> 正在执行 temporal update...")
+            try:
+                C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
+                    A_current,
+                    C_current,
+                    YrA=YrA,
+                    sparse_penal=float(sparse_pen),
+                    p=p,
+                    use_smooth=use_smooth,
+                    add_lag=add_lag,
+                    noise_freq=noise_freq,
+                )
+            except Exception:
+                C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
+                    A_current,
+                    C_current,
+                    YrA=YrA,
+                    sparse_penal=float(sparse_pen),
+                    p=max(1, p),
+                    use_smooth=False,
+                    add_lag="p",
+                    noise_freq=noise_freq,
+                )
+                
+            print(f"Sum of C_new: {float(np.abs(C_new).sum().compute().values)}")
+
+            # 详细诊断：temporal update 输出质量
+            diag_bundle["C_new_after_temporal"] = self._diagnose_da(
+                C_new, f"{step_name}:C_new_after_temporal", per_unit=True
+            )
+            diag_bundle["S_new_after_temporal"] = self._diagnose_da(
+                S_new, f"{step_name}:S_new_after_temporal", per_unit=True
+            )
+
+            if C_new.sizes.get("unit_id", 0) <= 0:
+                raise ValueError("temporal update 后无可用 unit（全部被丢弃）")
+
+            C_new = C_new.rename("C_new")
+
+            all_units = np.asarray(C_current.coords["unit_id"].values)
+            kept_units = np.asarray(C_new.coords["unit_id"].values)
+            dropped_units = np.setdiff1d(all_units, kept_units)
+
+            dropped_before = []
+            dropped_after = []
+            dropped_ids = []
+            n_show = min(3, len(dropped_units))
+            for uid in dropped_units[:n_show]:
+                b_trace = C_current.sel(unit_id=uid).compute().values.astype(np.float32)
+                dropped_before.append(b_trace)
+                dropped_after.append(np.zeros_like(b_trace, dtype=np.float32))
+                dropped_ids.append(int(uid))
+
+            self.log_output.append("-> 正在生成 temporal update 热图可视化结果...")
+            img_array_update = create_temporal_matrix_plot(
+                C_current.compute().astype(np.float32).values,
+                C_new.compute().astype(np.float32).values,
+                S_new.compute().astype(np.float32).values,
+                step_name=f"{vis_step_title} Update",
+                dropped_examples={
+                    "unit_ids": dropped_ids,
+                    "before": dropped_before,
+                    "after": dropped_after,
+                },
+            )
+            self._save_data_to_repo(img_array_update, f"{step_name}_update_vis_array")
+            self._save_data_to_repo(img_array_update, f"{step_name}_c_s_vis_array")
+
+            chk = self._load_data_from_repo("chk_settings")
+            if not isinstance(chk, dict):
+                chk = {"frame": -1}
+            chk_frame = chk.get("frame", -1)
+            try:
+                chk_frame = int(chk_frame)
+            except Exception:
+                chk_frame = -1
+
+            self.log_output.append("-> 正在保存 temporal update 关键结果矩阵...")
+            C_saved = save_minian(
+                C_new.rename("C").chunk({"unit_id": 1, "frame": -1}),
+                intpath,
+                overwrite=True,
+            )
+            C_chk_saved = save_minian(
+                C_saved.rename("C_chk"),
+                intpath,
+                overwrite=True,
+                chunks={"unit_id": -1, "frame": chk_frame},
+            )
+            S_saved = save_minian(
+                S_new.rename("S").chunk({"unit_id": 1, "frame": -1}),
+                intpath,
+                overwrite=True,
+            )
+            b0_saved = save_minian(
+                b0_new.rename("b0").chunk({"unit_id": 1, "frame": -1}),
+                intpath,
+                overwrite=True,
+            )
+            c0_saved = save_minian(
+                c0_new.rename("c0").chunk({"unit_id": 1, "frame": -1}),
+                intpath,
+                overwrite=True,
+            )
+
+            self._save_data_to_repo(C_saved, "C_tmp_merge")
+            self._save_data_to_repo(C_chk_saved, "C_chk_tmp_merge")
+            self._save_data_to_repo(S_saved, "S_tmp_merge")
+            self._save_data_to_repo(b0_saved, "b0_tmp_merge")
+            self._save_data_to_repo(c0_saved, "c0_tmp_merge")
+            # print(f"DEBUG:Sum of C_saved: {float(np.abs(C_saved).sum().compute().values)}")
+            A_for_merge = A_current.sel(unit_id=C_saved.coords["unit_id"].values)
+            self._save_data_to_repo(A_for_merge, "A_tmp_merge")
+            diag_bundle["A_for_merge_before_unit_merge"] = self._diagnose_da(
+                A_for_merge, f"{step_name}:A_for_merge_before_unit_merge", per_unit=True
+            )
+
+            self.log_output.append("-> 正在执行 unit merge...")
+            A_mrg, C_mrg, sig_mrg_list = unit_merge(
+                A_for_merge,
+                C_saved,
+                [C_saved + b0_saved + c0_saved],
+                **merge_kwargs,
+            )
+            sig_mrg = sig_mrg_list[0] if sig_mrg_list else (C_mrg + 0)
+
+            # 同步 merge 后 unit 轴到其它 temporal 矩阵，避免仅 C 更新导致维度不一致。
+            merged_units = C_mrg.coords["unit_id"].values if "unit_id" in C_mrg.coords else None
+            if merged_units is not None:
+                S_mrg = (
+                    S_saved.reindex(unit_id=merged_units)
+                    .fillna(np.float32(0))
+                    .astype(np.float32)
+                    .rename("S")
+                )
+                b0_mrg = (
+                    b0_saved.reindex(unit_id=merged_units)
+                    .fillna(np.float32(0))
+                    .astype(np.float32)
+                    .rename("b0")
+                )
+                c0_mrg = (
+                    c0_saved.reindex(unit_id=merged_units)
+                    .fillna(np.float32(0))
+                    .astype(np.float32)
+                    .rename("c0")
+                )
+                self._save_data_to_repo(S_mrg, "S_tmp_merge")
+                self._save_data_to_repo(b0_mrg, "b0_tmp_merge")
+                self._save_data_to_repo(c0_mrg, "c0_tmp_merge")
+                self.log_output.append(
+                    f"-> merge 后矩阵同步: C/S/b0/c0 unit 数 {int(C_saved.sizes.get('unit_id', 0))} -> {int(C_mrg.sizes.get('unit_id', 0))}"
+                )
+            else:
+                S_mrg = S_saved
+                b0_mrg = b0_saved
+                c0_mrg = c0_saved
+                
+                # print(f"DEBUG:Sum of C_merged: {float(np.abs(C_mrg).sum().compute().values)}")
+
             img_array_merge = create_merge_matrix_plot(
-                C_before_comp, 
-                C_after_comp, 
-                step_name="First Merge"
+                C_saved.compute().astype(np.float32).values,
+                C_mrg.compute().astype(np.float32).values,
+                step_name=f"{vis_step_title} Merge",
             )
             self._save_data_to_repo(img_array_merge, f"{step_name}_merge_vis_array")
 
-            # --- 保存最终合并结果并更新 repo 中的主键 ---
-            self.log_output.append("-> 正在保存最终合并结果...")
+            if output_a_mrg_key and output_c_mrg_key and output_c_chk_mrg_key and output_sig_mrg_key:
+                    # print(f"DEBUG:Sum of C_mrg for saving: {float(np.abs(C_mrg).sum().compute().values)}")
+                    # 关键修复：
+                    # 1) A 主键保持 dask-backed，避免 second spatial 中 map_blocks 在 numpy 后端崩溃
+                    # 2) C 先实体化，切断对上游惰性图/被 overwrite 路径的依赖，避免 C 退化为全零
+                    A_mem = A_mrg.compute().rename("A")
+                    C_mem = C_mrg.compute().rename("C")
+                    sig_mem = sig_mrg.rename("sig")
 
-            A_current = save_minian(A_mrg.rename("A"), intpath, overwrite=True)
-            self._save_data_to_repo(A_current, "A_iter1_merged")
+                    print(f"DEBUG: Sum of C_mem in memory: {float(np.abs(C_mem).sum())}")
 
-            C_current = save_minian(C_mrg.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C_current, "C_iter1_merged")
+                    # 运行态主键（供后续步骤直接消费）
+                    self._save_data_to_repo(A_mem, output_a_mrg_key)
+                    self._save_data_to_repo(C_mem, output_c_mrg_key)
+                    self._save_data_to_repo(C_mem.rename("C_chk"), output_c_chk_mrg_key)
+                    self._save_data_to_repo(sig_mem, output_sig_mrg_key)
+                    self._save_data_to_repo(S_mrg, "S_iter1_merged")
+                    self._save_data_to_repo(b0_mrg, "b0_iter1_merged")
+                    self._save_data_to_repo(c0_mrg, "c0_iter1_merged")
 
-            C_chk_current = save_minian(C_current.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_current, "C_chk_iter1_merged")
+                    # 落盘副本（排查/持久化）
+                    # 仅作为辅助，不应影响主流程；失败时记录告警并继续。
+                    try:
+                        A_final = save_minian(A_mrg.rename("A"), intpath, overwrite=True)
+                        C_final = save_minian(C_mem.rename("C"), intpath, overwrite=True)
+                        C_chk_final = save_minian(C_final.rename("C_chk"), intpath, overwrite=True)
+                        sig_final = save_minian(sig_mrg.rename("sig"), intpath, overwrite=True)
 
-            sig_current = save_minian(sig_mrg.rename("sig"), intpath, overwrite=True)
-            self._save_data_to_repo(sig_current, "sig_iter1_merged")
+                        self._save_data_to_repo(A_final, f"{output_a_mrg_key}_disk")
+                        self._save_data_to_repo(C_final, f"{output_c_mrg_key}_disk")
+                        self._save_data_to_repo(C_chk_final, f"{output_c_chk_mrg_key}_disk")
+                        self._save_data_to_repo(sig_final, f"{output_sig_mrg_key}_disk")
+                    except Exception as disk_err:
+                        self.log_output.append(
+                            f"⚠️ {step_name} 落盘副本保存失败（不影响主流程）: {disk_err}"
+                        )
 
-            self.log_output.append("✅ 步骤 13 运行完成。")
+                    # 备用镜像键（诊断/回退）
+                    self._save_data_to_repo(A_mem, f"{output_a_mrg_key}_mem")
+                    self._save_data_to_repo(C_mem, f"{output_c_mrg_key}_mem")
+
+                    # # 给 second spatial 专门留一份可追溯诊断
+                    # if step_name == "first_temporal_update_exec":
+                    #     self._save_data_to_repo(diag_bundle, "first_temporal_post_diag_detail")
+                    #     hint = ""
+                    #     a_diag = diag_bundle.get("A_mrg_after_unit_merge", {})
+                    #     if a_diag.get("available"):
+                    #         if int(a_diag.get("units_abs_gt0", 0)) == 0:
+                    #             hint = "first_temporal 合并后 A 全零/近零，second spatial 会全 drop"
+                    #         elif int(a_diag.get("units_pos_gt0", 0)) == 0:
+                    #             hint = "first_temporal 合并后 A 无正值面积，second spatial 基于正面积筛选会全 drop"
+                    #     if hint:
+                    #         self.log_output.append(f"[DIAG] {step_name} root_cause_hint: {hint}")
+
+            self.log_output.append("✅ temporal update + merge 完成，并已保存关键矩阵。")
+
+            self.steps_results[step_name] = True
             self.update_step_status(step_name, "已完成")
             return True
 
         except Exception as e:
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            self.log_output.append(traceback.format_exc())
             self.update_step_status(step_name, "错误")
             return False
+
+    def run_first_temporal_update_exec(self) -> bool:
+        return self._run_temporal_update_exec_common(
+            step_name="first_temporal_update_exec",
+            explore_step_name="first_temporal_update_explore",
+            a_key="A_iter1",
+            c_key="C_iter1",
+            c_chk_key="C_chk_iter1",
+            b_key="b_iter1",
+            f_key="f_iter1",
+            vis_step_title="First",
+            output_a_mrg_key="A_iter1_merged",
+            output_c_mrg_key="C_iter1_merged",
+            output_c_chk_mrg_key="C_chk_iter1_merged",
+            output_sig_mrg_key="sig_iter1_merged",
+        )
+
+    # 兼容旧测试入口
+    def run_first_temporal_update(self) -> bool:
+        return self.run_first_temporal_update_exec()
     
-    def run_second_spatial_update(self) -> bool:
-        """
-        步骤 14: 第二次空间更新 (Update Spatial) 与背景更新 (Update Background)
-        并保存 A, C, b, f 的第二次迭代结果。
-        """
-        step_name = 'second_spatial_update'
+    def _resolve_spatial_exec_penalty(self, explore_step_name: str, explore_params: dict, exec_params: dict) -> float:
+        # 1) 执行步骤显式参数优先（用于“确认最终值”）
+        p_exec = exec_params.get("sparse_penalty", exec_params.get("sparse_penal", None))
+        if p_exec is not None:
+            try:
+                return float(p_exec)
+            except Exception:
+                pass
+
+        exp_data = self.get_exploration_result(explore_step_name)
+        exp_state = self.get_exploration_state(explore_step_name)
+
+        if exp_data and exp_data.get("results"):
+            keys = sorted([float(k) for k in exp_data["results"].keys()])
+            selected = exp_state.get("selected_penalty", exp_data.get("default_penalty", keys[0]))
+            try:
+                selected = float(selected)
+                return min(keys, key=lambda x: abs(x - selected))
+            except Exception:
+                return float(keys[0])
+
+        p = (
+            explore_params.get("sparse_penalty")
+            or explore_params.get("sparse_penal")
+            or explore_params.get("sparse_penalty_list")
+            or explore_params.get("sparse_penal_list")
+            or 0.1
+        )
+        if isinstance(p, (list, tuple)) and len(p) > 0:
+            try:
+                return float(p[0])
+            except Exception:
+                return 0.1
+        try:
+            return float(str(p))
+        except Exception:
+            return 0.1
+
+    def _prepare_spatial_exec_inputs(self, a_key: str, c_key: str):
+        varr_mc_raw = self._load_data_from_repo("varr_mc")
+        varr_mc = varr_mc_raw[1] if isinstance(varr_mc_raw, tuple) else varr_mc_raw
+        A_init = self._load_data_from_repo(a_key)
+        C_init = self._load_data_from_repo(c_key)
+        sn_spatial = self._load_data_from_repo("sn_spatial")
+
+        if varr_mc is None or A_init is None or C_init is None:
+            raise ValueError(f"缺少空间更新执行所需输入(varr_mc/{a_key}/{c_key})")
+
+        if "unit_id" in A_init.coords and "unit_id" in C_init.coords:
+            common_units = np.intersect1d(A_init.coords["unit_id"].values, C_init.coords["unit_id"].values)
+            if len(common_units) == 0:
+                raise ValueError(f"{a_key} 与 {c_key} 没有公共 unit_id")
+            A_init = A_init.sel(unit_id=common_units)
+            C_init = C_init.sel(unit_id=common_units)
+
+        need_recompute_sn = sn_spatial is None
+        if (not need_recompute_sn) and hasattr(sn_spatial, "shape") and hasattr(varr_mc, "shape"):
+            try:
+                need_recompute_sn = tuple(sn_spatial.shape) != tuple(varr_mc.shape[1:])
+            except Exception:
+                need_recompute_sn = True
+        if need_recompute_sn:
+            sn_spatial = get_noise_fft(varr_mc.chunk({"frame": -1})).rename("sn_spatial")
+
+        varr_mc = varr_mc.chunk({"frame": -1}).fillna(0).astype(np.float32)
+        C_init = C_init.chunk({"frame": -1}).fillna(0).astype(np.float32)
+        A_init = A_init.fillna(0).astype(np.float32)
+        sn_spatial = xr.where(np.isfinite(sn_spatial), sn_spatial, np.float32(1e-6))
+        sn_spatial = xr.where(sn_spatial > 0, sn_spatial, np.float32(1e-6)).astype(np.float32)
+
+        return varr_mc, A_init, C_init, sn_spatial
+
+    def _run_spatial_update_exec_common(
+        self,
+        step_name: str,
+        explore_step_name: str,
+        a_key: str,
+        c_key: str,
+        f_fallback_key: str,
+        output_a_key: str,
+        output_c_key: str,
+        output_c_chk_key: str,
+        output_b_key: str,
+        output_f_key: str,
+        vis_step_title: str,
+        save_chk_settings: bool = False,
+    ) -> bool:
         self.update_step_status(step_name, "运行中")
         try:
-            # 1. 加载数据 (使用第一次合并后的结果作为起点)
             intpath = os.environ.get("MINIAN_INTERMEDIATE", "./intermediate_data")
-            varr_mc = self._load_data_from_repo('varr_mc')
-            A_init = self._load_data_from_repo('A_iter1_merged') # A 迭代起点
-            C_init = self._load_data_from_repo('C_iter1_merged') # C 迭代起点
-            C_chk_init = self._load_data_from_repo('C_chk_iter1_merged').rename("C_chk") 
-            sn_spatial = self._load_data_from_repo('sn_spatial') 
-            chk = self._load_data_from_repo('chk_settings')
-            
-            params = self.get_step_params(step_name)
-            # 假设第二次迭代的参数键为 'spatial_kwargs_iter2'
-            spatial_kwargs = params.get('spatial_kwargs_iter2', {}) 
 
-            # --- 第二次空间更新 ---
-            self.log_output.append("-> 正在执行第二次空间更新...")
-            # 使用第二次参数进行 update_spatial
-            A_new, mask, norm_fac = update_spatial(
-                varr_mc, A_init, C_init, sn_spatial, **spatial_kwargs
+            varr_mc, A_init, C_init, sn_spatial = self._prepare_spatial_exec_inputs(a_key, c_key)
+            
+            if step_name == "first_spatial_update_exec":
+                b_in = self._load_data_from_repo("b_init")
+                f_in = self._load_data_from_repo("f_init")
+            else:
+                b_in = self._load_data_from_repo("b_iter1")
+                f_in = self._load_data_from_repo("f_iter1")
+
+            explore_params = self.get_step_params(explore_step_name) or {}
+            exec_params = self.get_step_params(step_name) or {}
+            params = dict(explore_params)
+            params.update(exec_params)
+
+            sparse_pen = self._resolve_spatial_exec_penalty(explore_step_name, explore_params, exec_params)
+            self.log_output.append(f"-> {step_name} 使用 sparse_penalty={sparse_pen}")
+
+            size_thres_arg = self._normalize_size_thres(params.get("size_thres", (9, None)))
+            ret = update_spatial(
+                varr_mc,
+                A_init,
+                C_init,
+                sn_spatial,
+                b = b_in,
+                f = f_in,
+                dl_wnd=params.get("dl_wnd", 5),
+                sparse_penal=float(sparse_pen),
+                update_background=params.get("update_background", False),
+                normalize=params.get("normalize", True),
+                size_thres=size_thres_arg,
+                in_memory=params.get("in_memory", False),
             )
 
-            C_new = (C_init.sel(unit_id=mask) * norm_fac).rename("C_new")
-            C_new = save_minian(C_new, intpath, overwrite=True)
-            self._save_data_to_repo(C_new, "C_new_iter2")
+            A_new = ret[0]
+            mask = ret[1]
+            extra = ret[2:]
 
-            C_chk_new = (C_chk_init.sel(unit_id=mask) * norm_fac).rename("C_chk_new")
-            C_chk_new = save_minian(C_chk_new, intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_new, "C_chk_new_iter2")
+            # 关键兜底：若执行阶段被阈值全部过滤，自动放宽 size_thres 重试一次
+            kept_n = int(mask.sum().values) if hasattr(mask, "sum") else 0
+            if kept_n == 0:
+                relaxed_size_thres = (1, None)
+                self.log_output.append(
+                    f"⚠️ {step_name} 在 size_thres={size_thres_arg} 下全部单元被过滤，"
+                    f"自动放宽到 size_thres={relaxed_size_thres} 重试一次"
+                )
+                ret = update_spatial(
+                    varr_mc,
+                    A_init,
+                    C_init,
+                    sn_spatial,
+                    dl_wnd=params.get("dl_wnd", 5),
+                    sparse_penal=float(sparse_pen),
+                    update_background=params.get("update_background", False),
+                    normalize=params.get("normalize", True),
+                    size_thres=relaxed_size_thres,
+                    in_memory=True,
+                )
+                A_new = ret[0]
+                mask = ret[1]
+                extra = ret[2:]
 
-            # --- 背景更新 ---
-            self.log_output.append("-> 正在执行背景更新...")
-            b_new, f_new = update_background(varr_mc, A_new, C_chk_new)
-            
-            # --- 可视化 (2x2 空间足迹对比) ---
-            self.log_output.append("-> 正在生成第二次空间更新可视化结果 (Matplotlib 2x2)。")
-            
-            # 1. 准备数据 (计算 Dask 数组并转换为 NumPy)
+                kept_n = int(mask.sum().values) if hasattr(mask, "sum") else 0
+                if kept_n == 0:
+                    raise ValueError(
+                        f"{step_name} 过滤后无可用单元（size_thres={size_thres_arg}，放宽后仍为0）"
+                    )
+
+            norm_fac = None
+            b_new = None
+            if params.get("update_background", False) and params.get("normalize", True):
+                b_new, norm_fac = extra
+            elif params.get("update_background", False):
+                b_new = extra[0]
+            elif params.get("normalize", True):
+                norm_fac = extra[0]
+
+            C_new = C_init.sel(unit_id=mask)
+            if norm_fac is not None:
+                C_new = C_new * norm_fac
+            C_chk_new = C_new.rename("C_chk")
+
+            if b_new is None:
+                b_new, f_new = update_background(varr_mc, A_new, C_chk_new)
+            else:
+                f_new = self._load_data_from_repo(f_fallback_key)
+                if f_new is None:
+                    f_new = xr.zeros_like(C_new.isel(unit_id=0, drop=True)).rename("f")
+
             A_init_max = A_init.max("unit_id").compute().astype(np.float32).values
             A_init_sum = (A_init.fillna(0) > 0).sum("unit_id").compute().astype(np.uint8).values
             A_new_max = A_new.max("unit_id").compute().astype(np.float32).values
             A_new_sum = (A_new > 0).sum("unit_id").compute().astype(np.uint8).values
-            
-            # 2. 调用新的可视化函数
             img_array = create_spatial_update_plot(
-                A_init_max, 
-                A_init_sum, 
-                A_new_max, 
-                A_new_sum, 
-                step_name="Second Update" # 传入 step_name 区分
+                A_init_max,
+                A_init_sum,
+                A_new_max,
+                A_new_sum,
+                step_name=vis_step_title,
             )
-
-            # 3. 保存 NumPy 数组供 PyQt 显示
             self._save_data_to_repo(img_array, f"{step_name}_vis_array")
 
-            # --- 保存最终结果并更新 repo 中的主键 (Iter 2 的初始数据) ---
-            self.log_output.append("-> 正在保存 A, C, b, f 的第二次迭代结果...")
+            chk = self._load_data_from_repo("chk_settings")
+            if not isinstance(chk, dict):
+                chk = {"frame": -1}
+            chk_frame = chk.get("frame", -1)
+            try:
+                chk_frame = int(chk_frame)
+            except Exception:
+                chk_frame = -1
 
+            # 关键结果矩阵保存（对齐 Minian notebook 的 save results 逻辑）
             A = save_minian(
                 A_new.rename("A"),
                 intpath,
                 overwrite=True,
-                chunks=params.get('A_chunks', {"unit_id": 1, "height": -1, "width": -1}),
+                chunks={"unit_id": 1, "height": -1, "width": -1},
             )
-            self._save_data_to_repo(A, "A_iter2")
-            
             b = save_minian(b_new.rename("b"), intpath, overwrite=True)
-            self._save_data_to_repo(b, "b_iter2")
-
             f = save_minian(
-                f_new.chunk({"frame": chk["frame"]}).rename("f"), intpath, overwrite=True
+                f_new.chunk({"frame": chk_frame}).rename("f"),
+                intpath,
+                overwrite=True,
             )
-            self._save_data_to_repo(f, "f_iter2")
-
             C = save_minian(C_new.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C, "C_iter2")
-
             C_chk = save_minian(C_chk_new.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk, "C_chk_iter2")
 
-            self.log_output.append("✅ 步骤 14 运行完成。")
+            self._save_data_to_repo(A, output_a_key)
+            self._save_data_to_repo(C, output_c_key)
+            self._save_data_to_repo(C_chk, output_c_chk_key)
+            self._save_data_to_repo(b, output_b_key)
+            self._save_data_to_repo(f, output_f_key)
+            if save_chk_settings:
+                self._save_data_to_repo({"frame": -1}, "chk_settings")
+
+            self.log_output.append("✅ spatial update 关键矩阵已保存: A/b/f/C/C_chk")
+
+            self.steps_results[step_name] = True
             self.update_step_status(step_name, "已完成")
             return True
 
         except Exception as e:
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            self.log_output.append(traceback.format_exc())
             self.update_step_status(step_name, "错误")
             return False
 
-    def run_second_temporal_update(self) -> bool:
-        """
-        步骤 15: 第二次时间更新 (Update Temporal) 和单位合并 (Unit Merge)
-        更新 A, C, S, b0, c0 的新值。
-        """
-        step_name = 'second_temporal_update'
-        self.update_step_status(step_name, "运行中")
+    def run_first_spatial_update_exec(self) -> bool:
+        return self._run_spatial_update_exec_common(
+            step_name="first_spatial_update_exec",
+            explore_step_name="first_spatial_update_explore",
+            a_key="A_init",
+            c_key="C_init",
+            f_fallback_key="f_init",
+            output_a_key="A_iter1",
+            output_c_key="C_iter1",
+            output_c_chk_key="C_chk_iter1",
+            output_b_key="b_iter1",
+            output_f_key="f_iter1",
+            vis_step_title="First Update",
+            save_chk_settings=True,
+        )
+
+    # second_spatial_update / second_temporal_update 已移除
+
+    def _resolve_save_data_inputs(self) -> Dict[str, Optional[xr.DataArray]]:
+        """按优先级解析可用于 save_data 的矩阵来源。"""
+        intpath = os.environ.get("MINIAN_INTERMEDIATE", "./intermediate_data")
+        disk_ds_dict: Dict[str, Any] = {}
+
         try:
-            # 1. 加载数据 (使用迭代 2 空间更新后的结果)
-            intpath = os.environ.get("MINIAN_INTERMEDIATE", "./intermediate_data")
-            varr_mc = self._load_data_from_repo('varr_mc')
-            A_current = self._load_data_from_repo('A_iter2') # 对应 A
-            C_current = self._load_data_from_repo('C_iter2') # 对应 C
-            C_chk_current = self._load_data_from_repo('C_chk_iter2') # 对应 C_chk
-            b_current = self._load_data_from_repo('b_iter2') # 对应 b
-            f_current = self._load_data_from_repo('f_iter2') # 对应 f
-            chk = self._load_data_from_repo('chk_settings') 
-            
-            params = self.get_step_params(step_name)
-            # 假设第二次迭代的参数键
-            temporal_kwargs = params.get('temporal_kwargs_iter2', {})
-            merge_kwargs = params.get('merge_kwargs_iter2', {})
+            if os.path.isdir(intpath):
+                loaded = open_minian(intpath, return_dict=True)
+                if isinstance(loaded, dict):
+                    disk_ds_dict = loaded
+                elif isinstance(loaded, xr.Dataset):
+                    disk_ds_dict = {str(k): loaded[k] for k in loaded.data_vars.keys()}
+                else:
+                    disk_ds_dict = {}
+        except Exception:
+            # 读取磁盘失败时保持静默，继续走内存仓库
+            disk_ds_dict = {}
 
-            # --- 计算 YrA ---
-            self.log_output.append("-> 正在计算 YrA (残差/trace)...")
-            YrA = compute_trace(
-                varr_mc, A_current, b_current, C_chk_current, f_current
-            ).persist() 
-
-            # --- 第二次时间更新 ---
-            self.log_output.append("-> 正在执行第二次时间更新...")
-            # 使用第二次参数进行 update_temporal
-            C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
-                A_current, C_current, YrA=YrA, **temporal_kwargs
-            )
-            
-            C_new = C_new.rename("C_new")
-            C_chk_new = C_chk_current.sel(unit_id=C_new.coords["unit_id"].values).rename("C_chk_new")
-
-            # --- 可视化 (初始/第二次更新 C/S 矩阵图) ---
-            self.log_output.append("-> 正在生成时间更新和事件的矩阵可视化结果。")
-            
-            C_init_comp = C_current.compute().astype(np.float32).values
-            C_new_comp = C_new.compute().astype(np.float32).values
-            S_new_comp = S_new.compute().astype(np.float32).values
-            
-            # 调用新的 C/S 矩阵可视化函数
-            img_array_c_s = create_temporal_matrix_plot(
-                C_init_comp, 
-                C_new_comp, 
-                S_new_comp, 
-                step_name="Second Update"
-            )
-            self._save_data_to_repo(img_array_c_s, f"{step_name}_c_s_vis_array")
-            
-            # --- 可视化 (接受单位的细节) ---
-            self.log_output.append("-> 正在生成接受单位的详细时间更新可视化 (10个样本)。")
-            sig = C_new + b0_new + c0_new
-            
-            accepted_units = C_new.coords["unit_id"].values
-            units_to_sample = min(10, len(accepted_units))
-            np.random.seed(3) # 新的随机种子
-            sample_units = np.random.choice(accepted_units, units_to_sample, replace=False)
-            
-            A_comp = A_current.sel(unit_id=sample_units).compute()
-            C_comp = C_new.sel(unit_id=sample_units).compute()
-            S_comp = S_new.sel(unit_id=sample_units).compute()
-            
-            mean_C_idx = int(C_comp.mean('unit_id').argmax().values)
-            
-            for i, unit_id in enumerate(sample_units):
-                img_array_unit = create_cnmf_update_plot(
-                    varr_mc, 
-                    A_comp, 
-                    C_comp, 
-                    S_comp, 
-                    unit_id, 
-                    mean_C_idx
-                )
-                self._save_data_to_repo(img_array_unit, f"{step_name}_accepted_unit_{unit_id}_vis_array")
-
-
-            # --- 临时保存 C, C_chk, S, b0, c0 ---
-            self.log_output.append("-> 正在保存时间更新结果...")
-            
-            C_current = save_minian(C_new.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C_current, "C_tmp_merge")
-
-            C_chk_current = save_minian(C_chk_new.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_current, "C_chk_tmp_merge")
-
-            S_current = save_minian(S_new.rename("S"), intpath, overwrite=True)
-            self._save_data_to_repo(S_current, "S_tmp_merge")
-
-            b0_current = save_minian(b0_new.rename("b0"), intpath, overwrite=True)
-            self._save_data_to_repo(b0_current, "b0_tmp_merge")
-            
-            c0_current = save_minian(c0_new.rename("c0"), intpath, overwrite=True)
-            self._save_data_to_repo(c0_current, "c0_tmp_merge")
-            
-            A_current = A_current.sel(unit_id=C_current.coords["unit_id"].values)
-            self._save_data_to_repo(A_current, "A_tmp_merge")
-
-            # --- 单位合并 ---
-            self.log_output.append("-> 正在执行单位合并...")
-            A_mrg, C_mrg, sig_mrg_list = unit_merge(
-                A_current, 
-                C_current, 
-                [C_current + b0_current + c0_current], 
-                **merge_kwargs
-            )
-            sig_mrg = sig_mrg_list[0] 
-
-            # --- 合并可视化 (C 矩阵图对比) ---
-            self.log_output.append("-> 正在生成合并对比可视化。")
-            
-            C_before_comp = C_current.compute().astype(np.float32).values
-            C_after_comp = C_mrg.compute().astype(np.float32).values
-            
-            # 调用新的合并矩阵可视化函数
-            img_array_merge = create_merge_matrix_plot(
-                C_before_comp, 
-                C_after_comp, 
-                step_name="Second Merge"
-            )
-            self._save_data_to_repo(img_array_merge, f"{step_name}_merge_vis_array")
-
-
-            # --- 保存最终合并结果并更新 repo 中的主键 ---
-            self.log_output.append("-> 正在保存最终合并结果...")
-
-            A_current = save_minian(A_mrg.rename("A"), intpath, overwrite=True)
-            self._save_data_to_repo(A_current, "A_iter2_merged")
-
-            C_current = save_minian(C_mrg.rename("C"), intpath, overwrite=True)
-            self._save_data_to_repo(C_current, "C_iter2_merged")
-
-            C_chk_current = save_minian(C_current.rename("C_chk"), intpath, overwrite=True)
-            self._save_data_to_repo(C_chk_current, "C_chk_iter2_merged")
-
-            sig_current = save_minian(sig_mrg.rename("sig"), intpath, overwrite=True)
-            self._save_data_to_repo(sig_current, "sig_iter2_merged")
-
-            self.log_output.append("✅ 步骤 15 运行完成。")
-            self.update_step_status(step_name, "已完成")
+        def _valid(name: str, v: Any) -> bool:
+            if v is None:
+                return False
+            if not isinstance(v, xr.DataArray):
+                return True
+            try:
+                if name in ("A", "C", "S", "C_chk", "sig", "YrA") and "unit_id" in v.dims:
+                    if int(v.sizes.get("unit_id", 0)) <= 0:
+                        return False
+                if name in ("C", "S", "C_chk", "sig", "f", "YrA") and "frame" in v.dims:
+                    if int(v.sizes.get("frame", 0)) <= 0:
+                        return False
+            except Exception:
+                return True
             return True
 
-        except Exception as e:
-            self.log_output.append(f"运行【{step_name}】失败: {e}")
-            self.update_step_status(step_name, "错误")
-            return False
+        def _pick(name: str, *keys):
+            for k in keys:
+                v = self._load_data_from_repo(k)
+                if _valid(name, v):
+                    return v
+            # 回退：从中间目录读取（文件名通常直接是 A/C/S/b/f/...）
+            if name in disk_ds_dict:
+                v = disk_ds_dict.get(name)
+                if _valid(name, v):
+                    return v
+            return None
+
+        return {
+            "A": _pick("A", "A_iter1_merged", "A_iter1", "A_init"),
+            "C": _pick("C", "C_iter1_merged", "C_iter1", "C_init"),
+            "S": _pick("S", "S_iter1_merged", "S_tmp_merge"),
+            "YrA": _pick("YrA", "first_temporal_update_exec_YrA", "YrA"),
+            "c0": _pick("c0", "c0_iter1_merged", "c0_tmp_merge"),
+            "b0": _pick("b0", "b0_iter1_merged", "b0_tmp_merge"),
+            "b": _pick("b", "b_iter1", "b_init"),
+            "f": _pick("f", "f_iter1", "f_init"),
+            "C_chk": _pick("C_chk", "C_chk_iter1_merged", "C_chk_iter1", "C_chk_tmp_merge"),
+            "sig": _pick("sig", "sig_iter1_merged"),
+        }
+
+    @staticmethod
+    def _apply_excluded_units(data: Optional[xr.DataArray], excluded_units: List[int]) -> Optional[xr.DataArray]:
+        if data is None:
+            return None
+        if not excluded_units or "unit_id" not in getattr(data, "dims", ()): 
+            return data
+        keep_units = [
+            int(u) for u in data.coords["unit_id"].values
+            if int(u) not in set(int(x) for x in excluded_units)
+        ]
+        if len(keep_units) == 0:
+            raise ValueError("排除 unit_id 后无可保存单元，请减少排除数量")
+        return data.sel(unit_id=keep_units)
 
     def run_save_data(self) -> bool:
         """
-        步骤 16: 数据保存
-        将最终结果保存到 Minian 文件中（通常是 minian.nc）。
+        步骤 20: 数据保存
+        支持：矩阵多选 + 多保存格式(zarr/netcdf/csv/npy) + unit_id 排除过滤。
         """
         step_name = 'save_data'
         self.update_step_status(step_name, "运行中")
 
         try:
-            # from .utilities import save_minian
-            # 最终数据通常是最后一次迭代的结果
-            A = self._load_data_from_repo("A_iter2")
-            C = self._load_data_from_repo("C_iter2")
-            S = self._load_data_from_repo("S_iter2")
-            b = self._load_data_from_repo("b_iter2")
-            f = self._load_data_from_repo("f_iter2")
-            
             params = self.get_step_params(step_name)
 
-            self.log_output.append("-> 正在保存最终 CNMF 结果 (A, C, S, b, f)...")
-            
-            # 使用 save_minian 函数将 Dask 数组持久化到 Zarr 存储或 .nc 文件
-            save_minian_kwargs = params.get('save_minian_kwargs', {'dpath': './minian_output', 'overwrite': True})
-            
-            A = save_minian(A.rename("A"), **save_minian_kwargs)
-            C = save_minian(C.rename("C"), **save_minian_kwargs)
-            S = save_minian(S.rename("S"), **save_minian_kwargs)
-            b = save_minian(b.rename("b"), **save_minian_kwargs)
-            f = save_minian(f.rename("f"), **save_minian_kwargs)
-            
-            self.log_output.append("✅ 所有数据保存完成。")
+            prev_saved_paths = self._load_data_from_repo("save_data_saved_paths")
+            if isinstance(prev_saved_paths, dict) and len(prev_saved_paths) > 0:
+                self.log_output.append("-> 检测到已有保存记录，本次将覆盖同名输出并更新保存记录。")
+
+            selected_matrices = params.get("selected_matrices", ["A", "C", "S", "YrA", "c0", "b0", "b", "f"])
+            if not isinstance(selected_matrices, list):
+                selected_matrices = ["A", "C", "S", "YrA", "c0", "b0", "b", "f"]
+
+            save_format = str(params.get("save_format", "zarr")).lower()
+            output_dir = str(params.get("output_dir", "./minian_output"))
+            excluded_units_raw = params.get("excluded_unit_ids", [])
+            excluded_units = []
+            if isinstance(excluded_units_raw, list):
+                for x in excluded_units_raw:
+                    try:
+                        excluded_units.append(int(x))
+                    except Exception:
+                        continue
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            available = self._resolve_save_data_inputs()
+            to_save: Dict[str, xr.DataArray] = {}
+            for name in selected_matrices:
+                if name not in available:
+                    self.log_output.append(f"⚠️ 跳过未知矩阵: {name}")
+                    continue
+                arr = self._apply_excluded_units(available.get(name), excluded_units)
+                if arr is None:
+                    self.log_output.append(f"⚠️ 跳过缺失矩阵: {name}")
+                    continue
+                to_save[name] = arr.rename(name)
+
+            if not to_save:
+                raise ValueError("没有可保存的矩阵，请检查选择项与上游步骤输出")
+
+            self.log_output.append(
+                f"-> 正在保存矩阵 {list(to_save.keys())}，格式={save_format}，目录={output_dir}"
+            )
+
+            saved_paths: Dict[str, str] = {}
+            if save_format == "zarr":
+                for name, arr in to_save.items():
+                    saved = save_minian(arr, dpath=output_dir, overwrite=True)
+                    saved_paths[name] = str(getattr(saved, "name", name))
+            elif save_format == "netcdf":
+                ds = xr.Dataset({k: v for k, v in to_save.items()})
+                out_file = os.path.join(output_dir, "minian_dataset.nc")
+                ds.to_netcdf(out_file)
+                saved_paths["dataset"] = out_file
+            elif save_format == "csv":
+                for name, arr in to_save.items():
+                    out_file = os.path.join(output_dir, f"{name}.csv")
+                    arr.rename(name).to_series().reset_index().to_csv(out_file, index=False)
+                    saved_paths[name] = out_file
+            elif save_format == "npy":
+                for name, arr in to_save.items():
+                    out_file = os.path.join(output_dir, f"{name}.npy")
+                    np.save(out_file, arr.values)
+                    saved_paths[name] = out_file
+            else:
+                raise ValueError(f"不支持的保存格式: {save_format}")
+
+            self._save_data_to_repo(saved_paths, "save_data_saved_paths")
+            self._save_data_to_repo(excluded_units, "save_data_excluded_units")
+
+            self.log_output.append("✅ 数据保存完成。")
             self.update_step_status(step_name, "已完成")
             return True
             
         except Exception as e:
             self.log_output.append(f"运行【{step_name}】失败: {e}")
+            self.log_output.append(traceback.format_exc())
             self.update_step_status(step_name, "错误")
             return False

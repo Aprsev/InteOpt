@@ -7,11 +7,12 @@ from typing import Dict, Any, Optional, List, Tuple
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, 
     QComboBox, QMessageBox, QGroupBox, QSpinBox, QDoubleSpinBox, QSlider, 
-    QTextEdit, QFormLayout, QGridLayout, QScrollArea
+    QTextEdit, QFormLayout, QGridLayout, QScrollArea,QRadioButton, QButtonGroup,
+    QSizePolicy, QFileDialog, QListWidget, QListWidgetItem, QAbstractItemView, QToolTip
 )
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QSize, QMutex, QLocale, QObject
+    Qt, QThread, pyqtSignal, QSize, QMutex, QLocale, QObject, QEvent, QTimer
 )
 from PyQt5.QtGui import QPixmap, QImage, QColor
 import numpy as np
@@ -23,10 +24,20 @@ from threading import Lock
 from minian_processor import MinianProcessor # 假设已实现
 from minian_core.visualization import (
     get_normalized_video_frame,  
-    create_seeds_visualization, create_pnr_refine_plot, 
-    create_exploration_plot, create_cnmf_update_plot, normalize_frame,
+    create_seeds_visualization, 
+    create_pnr_refine_plot, 
+    create_exploration_plot,   # 可以保留（其他步骤可能还用）
+    create_cnmf_update_plot, 
+    normalize_frame,
     create_mc_max_projection_comparison,
-    create_init_visualization_plot 
+    create_init_visualization_plot,
+
+    # ✅ 新增这两个
+    create_spatial_exploration_plot,
+    create_spatial_exploration_compare_plot,
+    create_temporal_exploration_plot,
+    create_temporal_exploration_compare_plot,
+    create_save_data_dashboard,
 )
 
 # =========================================================================
@@ -50,10 +61,14 @@ PIPELINE_STEPS: List[Tuple[int, str, str, str]] = [
     (13, "初次空间更新 (执行)", "first_spatial_update_exec", "cnmf_update"),
     (14, "初次时间更新 (参数探索)", "first_temporal_update_explore", "exploration"),
     (15, "初次时间更新 (执行)", "first_temporal_update_exec", "cnmf_update"),
-    (16, "第二次空间更新", "second_spatial_update", "cnmf_update"),
-    (17, "第二次时间更新", "second_temporal_update", "cnmf_update"),
-    (18, "数据保存", "save_data", "none"),
+    (16, "数据保存", "save_data", "none"),
 ]
+
+SPATIAL_EXPLORE_STEPS = {"first_spatial_update_explore"}
+TEMPORAL_EXPLORE_STEPS = {"first_temporal_update_explore"}
+INTERACTIVE_EXPLORE_STEPS = SPATIAL_EXPLORE_STEPS | TEMPORAL_EXPLORE_STEPS
+TEMPORAL_UPDATE_STEPS = {"first_temporal_update_exec"}
+SAVE_DATA_MATRIX_ORDER = ["A", "C", "S", "YrA", "c0", "b0", "b", "f"]
 
 # 状态颜色
 STEP_STATUS_COLORS = {
@@ -74,6 +89,7 @@ class WorkerSignals(QObject):
     error = pyqtSignal(str, str, str) # (步骤名称, 错误类型, 错误信息)
     status_update = pyqtSignal(str, str) # (步骤代码名, 状态)
     step_result = pyqtSignal(str, object) # (步骤代码名, 结果数据)
+    step_completed = pyqtSignal(str, object) # (步骤代码名, 结果数据) - 仅成功完成后触发
     log_message = pyqtSignal(str) # 终端/日志输出
 
 class WorkerThread(QThread):
@@ -87,8 +103,12 @@ class WorkerThread(QThread):
         # self.mutex = QMutex()
         self.mutex = Lock()  
         self._is_running = False
-        self._current_task: Optional[Tuple[str, bool]] = None # (步骤代码名, 是否为运行全部)
+        self._current_task: Optional[Tuple[str, bool, Optional[str]]] = None # (步骤代码名, 是否为运行全部, 运行到步骤)
         self.all_steps_list = [name for _, _, name, _ in PIPELINE_STEPS]
+        self.exploration_mode = "single"
+        self.exploration_selected_penalty = None
+        self.exploration_left_penalty = None
+        self.exploration_right_penalty = None
 
     def set_task(self, step_name: str, run_all: bool = False, run_to: Optional[str] = None):
         """设置要运行的步骤或整个流程。
@@ -133,8 +153,15 @@ class WorkerThread(QThread):
             
             # 发送结果和状态更新
             self.signals.step_result.emit(step_name, result)
-            self.signals.status_update.emit(step_name, "已完成")
-            self.signals.log_message.emit(f"--- 步骤 {step_name} 成功完成 ---")
+
+            if result is False or result is None:
+                self.signals.status_update.emit(step_name, "错误")
+                self.signals.log_message.emit(f"--- 步骤 {step_name} 运行失败 ---")
+            else:
+                self.signals.status_update.emit(step_name, "已完成")
+                # 仅在后台计算成功完成后，再通知主线程刷新界面
+                self.signals.step_completed.emit(step_name, result)
+                self.signals.log_message.emit(f"--- 步骤 {step_name} 成功完成 ---")
 
         except Exception as e:
             error_type = type(e).__name__
@@ -145,40 +172,38 @@ class WorkerThread(QThread):
 
     def _run_all_steps_from(self, start_step_name: str, end_step_name: Optional[str] = None):
         """从指定步骤开始运行到结束步骤。
-        
         参数:
             start_step_name: 开始运行的步骤名称
             end_step_name: 结束运行的步骤名称 (None表示运行到最后)
         """
+        # 需要跳过的步骤
+        SKIP_STEPS = {"noise_freq_exploration", "first_spatial_update_explore", "first_temporal_update_explore"}
         try:
             start_index = self.all_steps_list.index(start_step_name)
             end_index = len(self.all_steps_list) if end_step_name is None else self.all_steps_list.index(end_step_name)
-            
             # 确保end_index不小于start_index
             if end_index < start_index:
                 end_index = start_index
                 self.signals.log_message.emit(f"警告: 目标步骤 {end_step_name} 在开始步骤 {start_step_name} 之前，将只运行开始步骤")
-            
             # 连续运行所有步骤直到结束步骤
             for i in range(start_index, end_index + 1):
                 step_name = self.all_steps_list[i]
-                
+                # 跳过探索类和噪声频率探索步骤
+                if step_name in SKIP_STEPS:
+                    self.signals.log_message.emit(f"[自动跳过] 步骤 {step_name} 属于参数探索/噪声频率探索，已跳过。")
+                    continue
                 # 检查是否应该停止
                 if not self._is_running:
                     self.signals.log_message.emit(f"--- 运行到步骤 {step_name} 被中断 ---")
                     break
-                    
                 self._run_single_step(step_name)
-                
                 # 检查步骤是否成功完成
                 if self.processor.get_step_status(step_name) != "已完成":
                     self.signals.log_message.emit(f"步骤 {step_name} 未成功完成，停止运行")
                     break
-                    
                 # 检查是否到达目标步骤
                 if i == end_index:
                     self.signals.log_message.emit(f"--- 成功运行到目标步骤 {step_name} ---")
-                    
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
@@ -220,6 +245,14 @@ class MainPipelineWindow(QWidget):
         self.current_frame = 0
         self.total_frames = 1 # 启动时默认为 1
         self.visualization_timer = None # 用于视频播放的 QTimer
+        self._is_updating_visualization = False
+        self._last_vis_error_signature = None
+        self._last_image_array: Optional[np.ndarray] = None
+        self._save_data_hover_enabled = False
+        self._save_data_hover_unit_map: Optional[np.ndarray] = None
+        self._save_data_hover_left_width = 0
+        self._save_data_dashboard_cache: Optional[Dict[str, Any]] = None
+        self._save_data_dashboard_cache_key: Optional[Tuple[Any, ...]] = None
         
         self.init_ui()
         self.init_worker_thread()
@@ -318,8 +351,21 @@ class MainPipelineWindow(QWidget):
         # 视频/图像显示 QLabel
         self.vis_label = QLabel("请运行第一步以加载视频...")
         self.vis_label.setAlignment(Qt.AlignCenter)
-        self.vis_label.setMinimumSize(700, 450)
-        self.vis_label.setStyleSheet("border: 1px solid black;")
+        self.vis_label.setMinimumSize(900, 560)
+        self.vis_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.vis_label.setMouseTracking(True)
+        self.vis_label.installEventFilter(self)
+        self.vis_label.setStyleSheet(
+            """
+            QLabel {
+                border: 1px solid #3B4252;
+                border-radius: 8px;
+                background-color: #0F1117;
+                color: #C9D1D9;
+                padding: 4px;
+            }
+            """
+        )
         vis_layout.addWidget(self.vis_label)
         
         # 视频控制条
@@ -346,6 +392,112 @@ class MainPipelineWindow(QWidget):
         video_control_layout.addWidget(self.forward_btn, 1, 3)
         
         vis_layout.addWidget(video_control_group)
+        self.explore_group = QGroupBox("探索结果切换")
+        self.explore_group.setVisible(False)
+        explore_layout = QGridLayout(self.explore_group)
+
+        self.radio_single = QRadioButton("单参数查看")
+        self.radio_compare = QRadioButton("双参数对比")
+        self.radio_single.setChecked(True)
+
+        self.explore_mode_group = QButtonGroup(self)
+        self.explore_mode_group.addButton(self.radio_single)
+        self.explore_mode_group.addButton(self.radio_compare)
+
+        self.penalty_select_combo = QComboBox()
+        self.left_penalty_combo = QComboBox()
+        self.right_penalty_combo = QComboBox()
+        self.btn_penalty_prev = QPushButton("上一个参数")
+        self.btn_penalty_next = QPushButton("下一个参数")
+        self.btn_compare_apply = QPushButton("应用双参数对比")
+
+        self.radio_single.toggled.connect(self.on_exploration_control_changed)
+        self.radio_compare.toggled.connect(self.on_exploration_control_changed)
+        self.penalty_select_combo.currentIndexChanged.connect(self.on_exploration_control_changed)
+        self.left_penalty_combo.currentIndexChanged.connect(self.on_exploration_control_changed)
+        self.right_penalty_combo.currentIndexChanged.connect(self.on_exploration_control_changed)
+        self.btn_penalty_prev.clicked.connect(lambda: self.switch_exploration_penalty(-1))
+        self.btn_penalty_next.clicked.connect(lambda: self.switch_exploration_penalty(1))
+        self.btn_compare_apply.clicked.connect(self.apply_exploration_compare_mode)
+
+        explore_layout.addWidget(self.radio_single, 0, 0)
+        explore_layout.addWidget(self.radio_compare, 0, 1)
+
+        explore_layout.addWidget(QLabel("当前参数"), 1, 0)
+        explore_layout.addWidget(self.penalty_select_combo, 1, 1)
+        explore_layout.addWidget(self.btn_penalty_prev, 1, 2)
+        explore_layout.addWidget(self.btn_penalty_next, 1, 3)
+
+        explore_layout.addWidget(QLabel("左侧参数"), 2, 0)
+        explore_layout.addWidget(self.left_penalty_combo, 2, 1)
+
+        explore_layout.addWidget(QLabel("右侧参数"), 3, 0)
+        explore_layout.addWidget(self.right_penalty_combo, 3, 1)
+        explore_layout.addWidget(self.btn_compare_apply, 3, 2, 1, 2)
+
+        vis_layout.addWidget(self.explore_group)
+
+        self.temporal_view_group = QGroupBox("Temporal 结果切换")
+        self.temporal_view_group.setVisible(False)
+        temporal_view_layout = QHBoxLayout(self.temporal_view_group)
+        temporal_view_layout.addWidget(QLabel("显示内容"))
+        self.temporal_view_combo = QComboBox()
+        self.temporal_view_combo.addItems(["update", "merge"])
+        self.temporal_view_combo.currentIndexChanged.connect(self.on_temporal_update_view_changed)
+        temporal_view_layout.addWidget(self.temporal_view_combo)
+        vis_layout.addWidget(self.temporal_view_group)
+
+        self.save_data_group = QGroupBox("数据保存设置与单元筛选")
+        self.save_data_group.setVisible(False)
+        save_layout = QGridLayout(self.save_data_group)
+
+        save_layout.addWidget(QLabel("保存矩阵(多选)"), 0, 0)
+        self.save_matrix_list = QListWidget()
+        self.save_matrix_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.save_matrix_list.setMaximumHeight(120)
+        self.save_matrix_list.itemChanged.connect(self.on_save_data_controls_changed)
+        save_layout.addWidget(self.save_matrix_list, 1, 0, 3, 1)
+
+        save_layout.addWidget(QLabel("保存格式"), 0, 1)
+        self.save_format_combo = QComboBox()
+        self.save_format_combo.addItems(["zarr", "netcdf", "csv", "npy"])
+        self.save_format_combo.currentIndexChanged.connect(self.on_save_data_controls_changed)
+        save_layout.addWidget(self.save_format_combo, 1, 1)
+
+        save_layout.addWidget(QLabel("保存目录"), 2, 1)
+        self.save_output_dir_edit = QLineEdit()
+        self.save_output_dir_edit.editingFinished.connect(self.on_save_data_controls_changed)
+        save_layout.addWidget(self.save_output_dir_edit, 3, 1)
+        self.btn_browse_save_dir = QPushButton("选择目录")
+        self.btn_browse_save_dir.clicked.connect(self.on_browse_save_output_dir)
+        save_layout.addWidget(self.btn_browse_save_dir, 3, 2)
+
+        save_layout.addWidget(QLabel("预览 unit_id"), 0, 2)
+        self.save_unit_combo = QComboBox()
+        self.save_unit_combo.currentIndexChanged.connect(self.on_save_data_unit_changed)
+        save_layout.addWidget(self.save_unit_combo, 1, 2)
+
+        self.btn_exclude_unit = QPushButton("排除当前 unit")
+        self.btn_exclude_unit.clicked.connect(self.on_exclude_current_unit)
+        save_layout.addWidget(self.btn_exclude_unit, 2, 2)
+
+        self.btn_reset_excluded = QPushButton("清空排除列表")
+        self.btn_reset_excluded.clicked.connect(self.on_reset_excluded_units)
+        save_layout.addWidget(self.btn_reset_excluded, 2, 3)
+
+        self.save_excluded_label = QLabel("已排除: 无")
+        save_layout.addWidget(self.save_excluded_label, 3, 3)
+
+        self.btn_save_data_now = QPushButton("立即保存（覆盖同名输出）")
+        self.btn_save_data_now.setStyleSheet("background-color: #90caf9;")
+        self.btn_save_data_now.clicked.connect(self.on_save_data_now_clicked)
+        save_layout.addWidget(self.btn_save_data_now, 4, 0, 1, 2)
+
+        self.save_data_status_label = QLabel("说明：再次点击会覆盖同名保存结果。")
+        save_layout.addWidget(self.save_data_status_label, 4, 2, 1, 2)
+
+        vis_layout.addWidget(self.save_data_group)
+
         right_layout.addWidget(vis_group)
         
         # 2. 终端输出/日志
@@ -372,6 +524,7 @@ class MainPipelineWindow(QWidget):
         self.worker_signals.status_update.connect(self._update_step_status)
         self.worker_signals.error.connect(self.handle_worker_error)
         self.worker_signals.step_result.connect(self.handle_step_result)
+        self.worker_signals.step_completed.connect(self.handle_step_completed)
         self.worker_signals.finished.connect(self.on_worker_finished)
         
         self.is_running_all = False
@@ -392,6 +545,17 @@ class MainPipelineWindow(QWidget):
         if hasattr(self, '_auto_run_target'):
             target_step = self._auto_run_target
             current_step = self.current_step_name
+            current_status = self.steps_status.get(current_step)
+
+            # 关键修复：自动运行模式下，若当前步骤失败则立即中止，避免死循环反复重试
+            if current_status == "错误":
+                QMessageBox.critical(
+                    self,
+                    "自动运行已中止",
+                    f"步骤 '{self.steps_map[current_step][1]}' 运行失败，已停止自动运行。\n请修正参数或数据后手动重试。"
+                )
+                delattr(self, '_auto_run_target')
+                return
             
             # 检查是否到达目标步骤
             if current_step == target_step:
@@ -460,7 +624,346 @@ class MainPipelineWindow(QWidget):
         self.update_parameters_panel()
         self.update_step_list_widget(force_select=True)
         self.visualize_current_step()
+    def refresh_exploration_controls(self, step_name: str):
+        data = self.processor.get_exploration_result(step_name)
+        is_explore = step_name in INTERACTIVE_EXPLORE_STEPS and data is not None
 
+        self.explore_group.setVisible(is_explore)
+        if not is_explore:
+            return
+        if data is None:
+            return
+
+        penalties = data.get("penalty_list", [])
+
+        # 避免每次刷新都重置用户选择
+        existing_items = [self.penalty_select_combo.itemText(i) for i in range(self.penalty_select_combo.count())]
+        new_items = [str(p) for p in penalties]
+        should_rebuild = existing_items != new_items
+
+        if should_rebuild:
+            for combo in [self.penalty_select_combo, self.left_penalty_combo, self.right_penalty_combo]:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItems(new_items)
+                combo.blockSignals(False)
+
+        state = self.processor.get_exploration_state(step_name)
+        default_penalty = state.get("selected_penalty", data.get("default_penalty", penalties[0] if penalties else None))
+
+        if default_penalty is not None and self.penalty_select_combo.count() > 0:
+            idx = self.penalty_select_combo.findText(str(default_penalty))
+            if idx >= 0 and self.penalty_select_combo.currentIndex() != idx:
+                self.penalty_select_combo.setCurrentIndex(idx)
+
+        if len(penalties) >= 2 and should_rebuild:
+            li = self.left_penalty_combo.findText(str(penalties[0]))
+            ri = self.right_penalty_combo.findText(str(penalties[1]))
+            if li >= 0:
+                self.left_penalty_combo.setCurrentIndex(li)
+            if ri >= 0:
+                self.right_penalty_combo.setCurrentIndex(ri)
+
+    def switch_exploration_penalty(self, direction: int):
+        step_name = self.current_step_name
+        if step_name not in INTERACTIVE_EXPLORE_STEPS or self.penalty_select_combo.count() == 0:
+            return
+        cur = self.penalty_select_combo.currentIndex()
+        if cur < 0:
+            cur = 0
+        nxt = max(0, min(self.penalty_select_combo.count() - 1, cur + direction))
+        if nxt != cur:
+            self.penalty_select_combo.setCurrentIndex(nxt)
+
+    def apply_exploration_compare_mode(self):
+        step_name = self.current_step_name
+        if step_name not in INTERACTIVE_EXPLORE_STEPS:
+            return
+        if self.left_penalty_combo.count() == 0 or self.right_penalty_combo.count() == 0:
+            return
+        self.radio_compare.setChecked(True)
+        self.on_exploration_control_changed()
+                
+    def on_exploration_control_changed(self):
+        step_name = self.current_step_name
+        if step_name not in INTERACTIVE_EXPLORE_STEPS:
+            return
+
+        state = {
+            "mode": "compare" if self.radio_compare.isChecked() else "single",
+            "selected_penalty": self.penalty_select_combo.currentText(),
+            "left_penalty": self.left_penalty_combo.currentText(),
+            "right_penalty": self.right_penalty_combo.currentText(),
+        }
+        self.processor.set_exploration_state(step_name, state)
+        self._update_visualization_frame()
+
+    def _pick_penalty_result(self, data: dict, penalty_text: str):
+        """容错选择 penalty 结果，避免浮点字符串精度导致 key 命中失败。"""
+        results = data.get("results", {})
+        if not results:
+            return 0.0, None
+
+        keys = sorted([float(k) for k in results.keys()])
+        try:
+            target = float(penalty_text)
+            best = min(keys, key=lambda x: abs(x - target))
+        except Exception:
+            best = keys[0]
+        return float(best), results.get(best)
+
+    def refresh_temporal_update_controls(self, step_name: str):
+        is_temporal_update = step_name in TEMPORAL_UPDATE_STEPS
+        self.temporal_view_group.setVisible(is_temporal_update)
+        if not is_temporal_update:
+            return
+
+        # 兼容旧键（例如 first_temporal_update_*）
+        legacy_step = step_name.replace("_exec", "")
+        has_update = (
+            self.processor._load_data_from_repo(f"{step_name}_update_vis_array") is not None
+            or self.processor._load_data_from_repo(f"{legacy_step}_update_vis_array") is not None
+            or self.processor._load_data_from_repo(f"{step_name}_c_s_vis_array") is not None
+            or self.processor._load_data_from_repo(f"{legacy_step}_c_s_vis_array") is not None
+        )
+        has_merge = (
+            self.processor._load_data_from_repo(f"{step_name}_merge_vis_array") is not None
+            or self.processor._load_data_from_repo(f"{legacy_step}_merge_vis_array") is not None
+        )
+
+        current = self.temporal_view_combo.currentText()
+        target_items = []
+        if has_update:
+            target_items.append("update")
+        if has_merge:
+            target_items.append("merge")
+        if not target_items:
+            target_items = ["update"]
+
+        existing_items = [self.temporal_view_combo.itemText(i) for i in range(self.temporal_view_combo.count())]
+        should_rebuild = existing_items != target_items
+
+        if should_rebuild:
+            self.temporal_view_combo.blockSignals(True)
+            self.temporal_view_combo.clear()
+            self.temporal_view_combo.addItems(target_items)
+            self.temporal_view_combo.blockSignals(False)
+
+        # 保持用户选择，不再每次刷新都回到 update
+        if current and self.temporal_view_combo.findText(current) >= 0:
+            idx = self.temporal_view_combo.findText(current)
+        else:
+            idx = 0
+        if self.temporal_view_combo.currentIndex() != idx:
+            self.temporal_view_combo.setCurrentIndex(idx)
+
+    def on_temporal_update_view_changed(self):
+        if self.current_step_name not in TEMPORAL_UPDATE_STEPS:
+            return
+        self._update_visualization_frame()
+
+    def refresh_save_data_controls(self, step_name: str):
+        is_save_data = step_name == "save_data"
+        self.save_data_group.setVisible(is_save_data)
+        if not is_save_data:
+            self._save_data_hover_enabled = False
+            self._save_data_hover_unit_map = None
+            self._save_data_hover_left_width = 0
+            self._save_data_dashboard_cache = None
+            self._save_data_dashboard_cache_key = None
+            QToolTip.hideText()
+            return
+
+        params = self.processor.get_step_params("save_data") or {}
+        selected = params.get("selected_matrices", ["A", "C", "S", "YrA", "c0", "b0", "b", "f"])
+        if not isinstance(selected, list):
+            selected = ["A", "C", "S", "c0", "b0", "b", "f"]
+        selected_set = set(str(x) for x in selected)
+
+        available = self.processor._resolve_save_data_inputs()
+
+        self.save_matrix_list.blockSignals(True)
+        self.save_matrix_list.clear()
+        for name in SAVE_DATA_MATRIX_ORDER:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Checked if name in selected_set else Qt.Unchecked)
+            self.save_matrix_list.addItem(item)
+        self.save_matrix_list.blockSignals(False)
+
+        save_format = str(params.get("save_format", "zarr")).lower()
+        idx = self.save_format_combo.findText(save_format)
+        if idx < 0:
+            idx = self.save_format_combo.findText("zarr")
+        if idx >= 0 and self.save_format_combo.currentIndex() != idx:
+            self.save_format_combo.blockSignals(True)
+            self.save_format_combo.setCurrentIndex(idx)
+            self.save_format_combo.blockSignals(False)
+
+        output_dir = str(params.get("output_dir", "./minian_output"))
+        if self.save_output_dir_edit.text() != output_dir:
+            self.save_output_dir_edit.setText(output_dir)
+
+        excluded_raw = params.get("excluded_unit_ids", [])
+        excluded = []
+        if isinstance(excluded_raw, list):
+            for x in excluded_raw:
+                try:
+                    excluded.append(int(x))
+                except Exception:
+                    continue
+
+        # 保留用户当前选择，避免每次刷新被重置到首项
+        prev_unit_text = self.save_unit_combo.currentText().strip() if self.save_unit_combo.count() > 0 else ""
+
+        unit_ids = []
+        unit_pool = set()
+        a_data = available.get("A")
+        if a_data is not None and "unit_id" in a_data.coords:
+            for u in a_data.coords["unit_id"].values:
+                unit_pool.add(int(u))
+        c_data = available.get("C")
+        c_units = []
+        if c_data is not None and "unit_id" in c_data.coords:
+            c_units = [int(u) for u in c_data.coords["unit_id"].values]
+
+        # 优先使用 C 的 unit 列表，保证右侧 C 曲线可用；若 C 缺失再回退 A
+        if len(c_units) > 0:
+            base_units = sorted(set(c_units))
+        else:
+            base_units = sorted(unit_pool)
+
+        for uid in base_units:
+            if uid not in set(excluded):
+                unit_ids.append(uid)
+
+        self.save_unit_combo.blockSignals(True)
+        self.save_unit_combo.clear()
+        if len(unit_ids) == 0:
+            self.save_unit_combo.addItem("(无可用 unit)")
+            self.save_unit_combo.setEnabled(False)
+            self.btn_exclude_unit.setEnabled(False)
+        else:
+            for uid in unit_ids:
+                self.save_unit_combo.addItem(str(uid))
+            self.save_unit_combo.setEnabled(True)
+            self.btn_exclude_unit.setEnabled(True)
+
+            # 还原此前选择
+            if prev_unit_text:
+                idx_prev = self.save_unit_combo.findText(prev_unit_text)
+                if idx_prev >= 0:
+                    self.save_unit_combo.setCurrentIndex(idx_prev)
+                else:
+                    self.save_unit_combo.setCurrentIndex(0)
+            else:
+                self.save_unit_combo.setCurrentIndex(0)
+        self.save_unit_combo.blockSignals(False)
+
+        ex_text = "无" if len(excluded) == 0 else ", ".join(str(x) for x in excluded[:12])
+        if len(excluded) > 12:
+            ex_text += " ..."
+        self.save_excluded_label.setText(f"已排除: {ex_text}")
+
+        a_obj = available.get("A")
+        c_obj = available.get("C")
+        a_sig = tuple(a_obj.sizes.items()) if isinstance(a_obj, xr.DataArray) else ()
+        c_sig = tuple(c_obj.sizes.items()) if isinstance(c_obj, xr.DataArray) else ()
+        new_cache_key = (id(a_obj), id(c_obj), a_sig, c_sig)
+        if self._save_data_dashboard_cache_key != new_cache_key:
+            self._save_data_dashboard_cache = None
+            self._save_data_dashboard_cache_key = new_cache_key
+
+    def _collect_save_data_ui_state(self) -> Dict[str, Any]:
+        selected = []
+        for i in range(self.save_matrix_list.count()):
+            item = self.save_matrix_list.item(i)
+            if item is not None and item.checkState() == Qt.Checked:
+                selected.append(item.text())
+
+        params = self.processor.get_step_params("save_data") or {}
+        old_excluded = params.get("excluded_unit_ids", [])
+        excluded = []
+        if isinstance(old_excluded, list):
+            for x in old_excluded:
+                try:
+                    excluded.append(int(x))
+                except Exception:
+                    continue
+
+        return {
+            "selected_matrices": selected,
+            "save_format": self.save_format_combo.currentText().strip().lower(),
+            "output_dir": self.save_output_dir_edit.text().strip() or "./minian_output",
+            "excluded_unit_ids": excluded,
+        }
+
+    def on_save_data_controls_changed(self):
+        if self.current_step_name != "save_data":
+            return
+        new_state = self._collect_save_data_ui_state()
+        self.processor.update_params("save_data", new_state)
+        self._update_visualization_frame()
+
+    def on_browse_save_output_dir(self):
+        cur = self.save_output_dir_edit.text().strip() or self.processor.video_folder
+        picked = QFileDialog.getExistingDirectory(self, "选择保存目录", cur)
+        if picked:
+            self.save_output_dir_edit.setText(picked)
+            self.on_save_data_controls_changed()
+
+    def on_save_data_unit_changed(self):
+        if self.current_step_name != "save_data":
+            return
+        self._update_visualization_frame()
+
+    def on_exclude_current_unit(self):
+        if self.current_step_name != "save_data":
+            return
+        if not self.save_unit_combo.isEnabled() or self.save_unit_combo.count() == 0:
+            return
+        txt = self.save_unit_combo.currentText().strip()
+        try:
+            uid = int(txt)
+        except Exception:
+            return
+
+        params = self.processor.get_step_params("save_data") or {}
+        excluded_raw = params.get("excluded_unit_ids", [])
+        excluded = []
+        if isinstance(excluded_raw, list):
+            for x in excluded_raw:
+                try:
+                    excluded.append(int(x))
+                except Exception:
+                    continue
+        if uid not in excluded:
+            excluded.append(uid)
+        params["excluded_unit_ids"] = sorted(set(excluded))
+        self.processor.update_params("save_data", params)
+        self.refresh_save_data_controls("save_data")
+        self._update_visualization_frame()
+
+    def on_reset_excluded_units(self):
+        if self.current_step_name != "save_data":
+            return
+        params = self.processor.get_step_params("save_data") or {}
+        params["excluded_unit_ids"] = []
+        self.processor.update_params("save_data", params)
+        self.refresh_save_data_controls("save_data")
+        self._update_visualization_frame()
+
+    def on_save_data_now_clicked(self):
+        if self.current_step_name != "save_data":
+            self.current_step_name = "save_data"
+            self.update_parameters_panel()
+            self.update_step_list_widget(force_select=True)
+            self.visualize_current_step()
+
+        self.on_save_data_controls_changed()
+        self.save_data_status_label.setText("正在保存...（同名文件将被覆盖）")
+        self.run_current_step()
+        
     def run_current_step(self):
         """
         运行当前选定步骤的逻辑。
@@ -469,9 +972,12 @@ class MainPipelineWindow(QWidget):
         3. 启动工作线程执行当前步骤。
         """
         step_name = self.current_step_name
+
+        if step_name == "save_data":
+            self.on_save_data_controls_changed()
         
         # 1. 检查并保存参数
-        if self._check_and_save_parameters(step_name):
+        if step_name != "save_data" and self._check_and_save_parameters(step_name):
             self.log_output.append(f"参数已更新并保存到配置库。")
             
         # 2. 标记后续步骤为 '未运行' 并清除缓存
@@ -560,6 +1066,14 @@ class MainPipelineWindow(QWidget):
             
         # 检查当前步骤状态
         current_status = self.steps_status.get(current_step)
+
+        # 关键修复：若当前步骤已处于错误态，直接停止，不再重复触发同一步骤
+        if current_status == "错误":
+            self.log_output.append(f"自动运行中止: 步骤 {current_step} 运行失败，不再自动重试。")
+            self._set_ui_running_state(False)
+            if hasattr(self, '_auto_run_target'):
+                delattr(self, '_auto_run_target')
+            return
         
         if current_status != "已完成":
             # 如果当前步骤未完成，先运行当前步骤
@@ -718,10 +1232,6 @@ class MainPipelineWindow(QWidget):
         """更新步骤状态，并触发 UI 刷新。"""
         self.steps_status[step_name] = status
         self.update_step_list_widget()
-        
-        # 如果是当前步骤状态更新，触发可视化更新
-        if step_name == self.current_step_name and status == "已完成":
-            self.visualize_current_step()
 
     def update_step_list_widget(self, force_select: bool = False):
         """刷新步骤列表和下拉框，显示状态和当前选择。"""
@@ -922,7 +1432,7 @@ class MainPipelineWindow(QWidget):
 
 
     def handle_step_result(self, step_name: str, result: Any):
-        """处理步骤运行结果，存储并触发可视化更新。"""
+        """处理步骤运行结果，仅存储数据，不立即重绘。"""
         # 存储结果
         self.steps_results[step_name] = result
         self.log_output.append(f"步骤 {self.steps_map[step_name][1]} 结果已接收。{result}")
@@ -934,16 +1444,41 @@ class MainPipelineWindow(QWidget):
             self.slider.setEnabled(True)
             self.frame_label.setText(f"帧: {self.current_frame} / {self.total_frames}")
 
-        temp_step_name = self.current_step_name
-        
-        # (B) 强制将 UI 的当前步骤设置回刚刚完成的步骤
-        self.current_step_name = step_name
-        # (C) 调用可视化刷新
-        self.visualize_current_step()
-        # (D) 恢复 UI 的当前步骤（如果它已经被线程切换了）
-        self.current_step_name = temp_step_name
-        # (E) 刷新步骤列表，确保高亮显示正确
-        self.update_step_list_widget(force_select=True)
+    def handle_step_completed(self, step_name: str, result: Any):
+        """后台步骤完成后触发：通过事件队列延迟刷新，避免界面阻塞。"""
+        # 结果兜底保存
+        self.steps_results[step_name] = result
+
+        # “运行到指定步骤”模式：每完成一步都刷新该步骤可视化
+        force_switch = hasattr(self, '_auto_run_target')
+
+        # 通过 queued 调度在主线程空闲时刷新，降低卡顿风险
+        QTimer.singleShot(0, lambda sn=step_name, fs=force_switch: self._refresh_after_step_completed(sn, fs))
+
+    def _refresh_after_step_completed(self, step_name: str, force_switch: bool = False):
+        if self.steps_status.get(step_name) != "已完成":
+            return
+
+        if step_name == "save_data" and hasattr(self, "save_data_status_label"):
+            self.save_data_status_label.setText("保存完成。再次点击会覆盖同名保存结果。")
+
+        prev_step = self.current_step_name
+        try:
+            if force_switch:
+                self.current_step_name = step_name
+                self.update_parameters_panel()
+                self.update_step_list_widget(force_select=True)
+                self.visualize_current_step()
+            else:
+                if step_name != self.current_step_name:
+                    return
+                self.visualize_current_step()
+                self.update_step_list_widget(force_select=True)
+        finally:
+            # “运行到指定步骤”过程中，保持当前步骤为已完成步骤，
+            # 便于用户看到逐步更新的可视化。
+            if not force_switch:
+                self.current_step_name = prev_step
             
     def visualize_current_step(self):
         """
@@ -951,10 +1486,12 @@ class MainPipelineWindow(QWidget):
         最后调用 _update_visualization_frame 刷新显示。
         """
         step_name = self.current_step_name
+        self.refresh_temporal_update_controls(step_name)
+        self.refresh_save_data_controls(step_name)
         # 🚨 警告修复点：获取步骤状态并检查是否已完成
         status = self.steps_status.get(step_name)
         
-        if status != "已完成":
+        if status != "已完成" and step_name != "save_data":
             # 如果步骤不是“已完成”，则清空显示，禁用滑块，并立即退出
             self.total_frames = 1
             self.current_frame = 0
@@ -1006,11 +1543,17 @@ class MainPipelineWindow(QWidget):
         
     def _update_visualization_frame(self):
         """根据当前的 self.current_frame 和 self.current_step_name 刷新显示。"""
+        if self._is_updating_visualization:
+            return
+
+        self._is_updating_visualization = True
         step_name = self.current_step_name
         vis_type = self.steps_map[step_name][2] # 保持 [3] 索引不变，假设您已修正 steps_map 的创建逻辑
         result = self.steps_results.get(step_name)
 
-        if result is None: return
+        if result is None and step_name != "save_data":
+            self._is_updating_visualization = False
+            return
 
         frame_idx = self.current_frame
         image_array: Optional[np.ndarray] = None
@@ -1021,6 +1564,9 @@ class MainPipelineWindow(QWidget):
         # varr: 用于作为背景的视频数组
 
         varr = self.processor.get_varr_for_vis(step_name) 
+
+        self.refresh_temporal_update_controls(step_name)
+        self.refresh_save_data_controls(step_name)
             
         # self.log_output.append(f"背景视频: {varr}")
 
@@ -1180,47 +1726,269 @@ class MainPipelineWindow(QWidget):
 
                 
             elif vis_type == "exploration":
-                # 步骤 11, 13 (result 是 A_list)
-                # Exploration plots are static and don't change per frame
-                if frame_idx == 0:
-                     # 假设 result 包含 A_list 和 penalties list
-                     # TODO: 实际需要从 self.processor 获取探索参数和结果
-                     A_list = self.processor.get_exploration_A_list(step_name) 
-                     penalties = self.processor.get_exploration_penalties(step_name)
-                     image_array = create_exploration_plot(varr, A_list, penalties, frame_idx)
+                data = self.processor.get_exploration_result(step_name)
+                if data is None:
+                    self.vis_label.setText("尚无探索结果，请先运行该步骤。")
+                    return
+
+                self.refresh_exploration_controls(step_name)
+
+                state = self.processor.get_exploration_state(step_name)
+                mode = state.get("mode", "single")
+
+                if mode == "compare":
+                    left_pen, left_res = self._pick_penalty_result(
+                        data,
+                        state.get("left_penalty", str(data["penalty_list"][0]))
+                    )
+                    default_right = data["penalty_list"][1 if len(data['penalty_list']) > 1 else 0]
+                    right_pen, right_res = self._pick_penalty_result(
+                        data,
+                        state.get("right_penalty", str(default_right))
+                    )
+                    if left_res is None or right_res is None:
+                        self.vis_label.setText("参数对比数据不可用，请重新选择参数。")
+                        return
+
+                    if step_name in SPATIAL_EXPLORE_STEPS:
+                        image_array = create_spatial_exploration_compare_plot(
+                            left_res,
+                            right_res,
+                            float(left_pen),
+                            float(right_pen)
+                        )
+                        self.vis_label.setText(
+                            f"步骤 '{self.steps_map[step_name][1]}': spatial 左右对比 ({left_pen} vs {right_pen})"
+                        )
+                    else:
+                        image_array = create_temporal_exploration_compare_plot(
+                            left_res,
+                            right_res,
+                            float(left_pen),
+                            float(right_pen)
+                        )
+                        self.vis_label.setText(
+                            f"步骤 '{self.steps_map[step_name][1]}': temporal 上下对比 ({left_pen} vs {right_pen})"
+                        )
+
+                else:
+                    selected_pen, cur_res = self._pick_penalty_result(
+                        data,
+                        state.get("selected_penalty", str(data.get("default_penalty", data["penalty_list"][0])))
+                    )
+                    if cur_res is None:
+                        self.vis_label.setText("参数结果不可用，请重新选择参数。")
+                        return
+
+                    if step_name in SPATIAL_EXPLORE_STEPS:
+                        image_array = create_spatial_exploration_plot(cur_res, float(selected_pen))
+                    else:
+                        image_array = create_temporal_exploration_plot(cur_res, float(selected_pen))
+                    self.vis_label.setText(
+                        f"步骤 '{self.steps_map[step_name][1]}': sparse_penalty = {selected_pen}"
+                    )
 
             elif vis_type == "cnmf_update":
-                # 步骤 12, 14, 15, 16 (result 是 (A, C, S) tuple)
-                # TODO: 需要在 UI 上添加 Unit ID 选择框，这里假设 unit_id=0
-                A_comp, C_comp, S_comp = result 
-                unit_id = 0 # 假设默认显示第一个单元
-                image_array = create_cnmf_update_plot(varr, A_comp, C_comp, S_comp, unit_id, frame_idx)
+                # 空间更新执行步骤：显示整视野 2x2 结果，不再选单个 unit
+                if step_name in {"first_spatial_update_exec"}:
+                    image_array = self.processor._load_data_from_repo(f"{step_name}_vis_array")
+                    if image_array is None:
+                        self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}' 尚无整视野可视化结果。")
+                        return
+                elif step_name in TEMPORAL_UPDATE_STEPS:
+                    view_mode = self.temporal_view_combo.currentText() if self.temporal_view_combo.count() > 0 else "update"
+                    legacy_step = step_name.replace("_exec", "")
+                    image_array = self.processor._load_data_from_repo(f"{step_name}_{view_mode}_vis_array")
+                    if image_array is None:
+                        image_array = self.processor._load_data_from_repo(f"{legacy_step}_{view_mode}_vis_array")
+                    if image_array is None and view_mode == "update":
+                        image_array = self.processor._load_data_from_repo(f"{step_name}_c_s_vis_array")
+                    if image_array is None and view_mode == "update":
+                        image_array = self.processor._load_data_from_repo(f"{legacy_step}_c_s_vis_array")
+                    if image_array is None:
+                        self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}' 的 {view_mode} 可视化结果不存在。")
+                        return
+                    self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}': temporal {view_mode} 热图")
+                else:
+                    # 其他 cnmf_update 维持原逻辑
+                    if varr is None:
+                        self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}' 缺少背景视频数据，无法可视化。")
+                        return
+                    A_comp, C_comp, S_comp = result
+                    unit_id = 0
+                    image_array = create_cnmf_update_plot(varr, A_comp, C_comp, S_comp, unit_id, frame_idx)
 
             elif vis_type == "none":
-                self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}' (数据保存) 无可视化结果。")
-                return
+                if step_name == "save_data":
+                    params = self.processor.get_step_params("save_data") or {}
+                    excluded_raw = params.get("excluded_unit_ids", [])
+                    excluded_units = []
+                    if isinstance(excluded_raw, list):
+                        for x in excluded_raw:
+                            try:
+                                excluded_units.append(int(x))
+                            except Exception:
+                                continue
+
+                    available = self.processor._resolve_save_data_inputs()
+                    A = available.get("A")
+                    C = available.get("C")
+
+                    unit_id = None
+                    if self.save_unit_combo.isEnabled() and self.save_unit_combo.count() > 0:
+                        try:
+                            unit_id = int(self.save_unit_combo.currentText())
+                        except Exception:
+                            unit_id = None
+
+                    # 若当前选择 unit 在 C 中不存在，自动回退到 C 的首个可用 unit，避免“无曲线”
+                    if C is not None and "unit_id" in getattr(C, "coords", {}):
+                        c_units = [int(u) for u in C.coords["unit_id"].values]
+                        if len(c_units) > 0 and (unit_id is None or unit_id not in set(c_units)):
+                            unit_id = int(c_units[0])
+                            if self.save_unit_combo.isEnabled():
+                                idx = self.save_unit_combo.findText(str(unit_id))
+                                if idx >= 0 and self.save_unit_combo.currentIndex() != idx:
+                                    self.save_unit_combo.blockSignals(True)
+                                    self.save_unit_combo.setCurrentIndex(idx)
+                                    self.save_unit_combo.blockSignals(False)
+
+                    dashboard = create_save_data_dashboard(
+                        A=A,
+                        C=C,
+                        unit_id=unit_id,
+                        excluded_units=excluded_units,
+                        dashboard_cache=self._save_data_dashboard_cache,
+                    )
+                    image_array = dashboard.get("image")
+                    if isinstance(dashboard.get("cache"), dict):
+                        self._save_data_dashboard_cache = dashboard.get("cache")
+                    self._save_data_hover_unit_map = dashboard.get("unit_id_map")
+                    self._save_data_hover_left_width = int(dashboard.get("left_width", 0) or 0)
+                    self._save_data_hover_enabled = (
+                        isinstance(self._save_data_hover_unit_map, np.ndarray)
+                        and self._save_data_hover_unit_map.ndim == 2
+                        and self._save_data_hover_left_width > 0
+                    )
+                    self.vis_label.setText(
+                        f"步骤 '{self.steps_map[step_name][1]}': 可交互预览 (unit 空间分布 + 时间曲线)"
+                    )
+                else:
+                    self.vis_label.setText(f"步骤 '{self.steps_map[step_name][1]}' (数据保存) 无可视化结果。")
+                    return
 
             if image_array is not None:
-                # 确保图像是 RGB 或 BGR (H, W, 3) 格式
-                h, w, c = image_array.shape
-                bytes_per_line = c * w
-                
-                # 图像可能是 BGR 或 RGB，这里假设所有可视化函数返回 BGR (OpenCV 标准)
-                q_image = QImage(image_array.data, w, h, bytes_per_line, QImage.Format_BGR888) 
-                pixmap = QPixmap.fromImage(q_image)
-                
-                # 缩放以适应 QLabel
-                pixmap = pixmap.scaled(self.vis_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.vis_label.setPixmap(pixmap)
+                self._last_image_array = image_array
+                self._render_image_array(image_array)
 
             self.frame_label.setText(f"帧: {frame_idx + 1} / {self.total_frames}")
+            self.slider.blockSignals(True)
             self.slider.setValue(frame_idx)
+            self.slider.blockSignals(False)
+
+            # 可视化成功后清空错误签名，允许后续新错误正常上报
+            self._last_vis_error_signature = None
 
         except Exception as e:
             error_trace = traceback.format_exc()
             self.vis_label.setText(f"可视化错误: {type(e).__name__}\n请检查日志")
-            self.log_output.append(f"*** 可视化失败: {step_name} ***\n{error_trace}")
+            err_sig = (step_name, type(e).__name__, str(e))
+            if err_sig != self._last_vis_error_signature:
+                self.log_output.append(f"*** 可视化失败: {step_name} ***\n{error_trace}")
+                self._last_vis_error_signature = err_sig
             self.slider.setEnabled(False)
+            # 发生可视化异常时停止播放，避免定时器重复触发导致“死循环”
+            self.stop_playback()
+        finally:
+            self._is_updating_visualization = False
+
+    def _render_image_array(self, image_array: np.ndarray):
+        """统一渲染入口：按可视区域填充并保持平滑缩放。"""
+        if image_array is None:
+            return
+        if not isinstance(image_array, np.ndarray) or image_array.ndim != 3 or image_array.shape[2] != 3:
+            self.vis_label.setText("可视化数据格式异常")
+            return
+
+        h, w, c = image_array.shape
+        bytes_per_line = c * w
+        q_image = QImage(image_array.data, w, h, bytes_per_line, QImage.Format_BGR888)
+        pixmap = QPixmap.fromImage(q_image)
+        # 使用 KeepAspectRatio 避免边缘被裁剪，保证整图完整可见
+        pixmap = pixmap.scaled(self.vis_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.vis_label.setPixmap(pixmap)
+
+    def resizeEvent(self, event):
+        """窗口尺寸变化时，重绘最后一帧/最后一张图，让画面持续填充。"""
+        super().resizeEvent(event)
+        if self._last_image_array is not None:
+            self._render_image_array(self._last_image_array)
+
+    def eventFilter(self, obj, event):
+        if obj is self.vis_label:
+            if event.type() == QEvent.MouseMove:
+                self._handle_save_data_hover(event)
+            elif event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._handle_save_data_click(event)
+        return super().eventFilter(obj, event)
+
+    def _map_event_to_save_data_unit(self, event) -> Optional[int]:
+        if self.current_step_name != "save_data" or not self._save_data_hover_enabled:
+            return None
+        if self.vis_label.pixmap() is None or self._last_image_array is None:
+            return None
+
+        pm = self.vis_label.pixmap()
+        pm_w, pm_h = pm.width(), pm.height()
+        if pm_w <= 0 or pm_h <= 0:
+            return None
+
+        lbl_w, lbl_h = self.vis_label.width(), self.vis_label.height()
+        ox = (lbl_w - pm_w) // 2
+        oy = (lbl_h - pm_h) // 2
+
+        ex, ey = event.pos().x(), event.pos().y()
+        if ex < ox or ey < oy or ex >= ox + pm_w or ey >= oy + pm_h:
+            return None
+
+        img_h, img_w = self._last_image_array.shape[:2]
+        ix = int((ex - ox) * img_w / max(1, pm_w))
+        iy = int((ey - oy) * img_h / max(1, pm_h))
+        if ix < 0 or iy < 0 or ix >= img_w or iy >= img_h:
+            return None
+
+        if ix >= self._save_data_hover_left_width:
+            return None
+
+        m = self._save_data_hover_unit_map
+        if m is None:
+            return None
+
+        mh, mw = m.shape
+        mx = int(ix * mw / max(1, self._save_data_hover_left_width))
+        my = int(iy * mh / max(1, img_h))
+        if mx < 0 or my < 0 or mx >= mw or my >= mh:
+            return None
+
+        uid = int(m[my, mx])
+        return uid if uid >= 0 else None
+
+    def _handle_save_data_hover(self, event):
+        uid = self._map_event_to_save_data_unit(event)
+        if uid is None:
+            QToolTip.hideText()
+            return
+        QToolTip.showText(event.globalPos(), f"unit_id: {uid}", self.vis_label)
+
+    def _handle_save_data_click(self, event):
+        uid = self._map_event_to_save_data_unit(event)
+        if uid is None or not self.save_unit_combo.isEnabled():
+            return
+        idx = self.save_unit_combo.findText(str(uid))
+        if idx >= 0:
+            self.save_unit_combo.setCurrentIndex(idx)
+            self._update_visualization_frame()
+
     def toggle_playback(self):
         """开始/暂停视频播放，自动根据视频 FPS 设置播放速度。"""
         from PyQt5.QtCore import QTimer
